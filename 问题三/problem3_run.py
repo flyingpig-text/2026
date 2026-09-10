@@ -18,6 +18,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 
 from problem3_core import (
     DT_H,
@@ -67,6 +70,51 @@ def output_dates(data: pd.DataFrame) -> list[date]:
     )
 
 
+def run_baseline_benchmark(
+    p2,
+    data: pd.DataFrame,
+    storage,
+) -> pd.DataFrame:
+    """
+    运行简单基准算例：储能不动作，实际净负荷全部由计划购电满足。
+
+    该基准不涉及滚动调整，只用于确认附件读取、电量换算和电能平衡。
+    """
+    rows: list[dict[str, object]] = []
+    print("步骤1：运行储能不动作基准算例。")
+    for target in TARGET_DATES:
+        day = data[data["日期"].dt.date == target].sort_values("时段序号")
+        load = day["小区负载电量_kWh"].to_numpy(dtype=float)
+        pv = day["光伏实际电量_kWh"].to_numpy(dtype=float)
+        price = day["电价_元每kWh"].to_numpy(dtype=float)
+        dispatch = p2.baseline_day(load, pv, price, storage.initial_kwh)
+        balance_error = (
+            dispatch.planned_purchase_kwh
+            + pv
+            + dispatch.discharge_kwh
+            - load
+            - dispatch.charge_kwh
+            - dispatch.curtail_kwh
+        )
+        rows.append(
+            {
+                "日期": target,
+                "计划购电量_kWh": float(dispatch.planned_purchase_kwh.sum()),
+                "购电费_元": float(dispatch.total_cost_yuan),
+                "最大电能平衡残差_kWh": float(np.max(np.abs(balance_error))),
+            }
+        )
+        print(
+            f"{target}：计划购电量="
+            f"{dispatch.planned_purchase_kwh.sum():.6f} kWh，"
+            f"购电费={dispatch.total_cost_yuan:.6f} 元，"
+            f"最大平衡残差={np.max(np.abs(balance_error)):.3e} kWh。"
+        )
+    result = pd.DataFrame(rows)
+    result["日期"] = pd.to_datetime(result["日期"])
+    return result
+
+
 def solve_problem3(
     p2,
     data: pd.DataFrame,
@@ -109,6 +157,136 @@ def solve_problem3(
     daily["日期"] = pd.to_datetime(daily["日期"])
     scenarios["日期"] = pd.to_datetime(scenarios["日期"])
     return detail, daily, scenarios
+
+
+def write_table1_excel(
+    detail: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """按表1格式写出指定日期的购电量和全天费用。"""
+    intervals = (
+        "10:00-10:10",
+        "12:00-12:10",
+        "14:00-14:10",
+        "16:00-16:10",
+        "18:00-18:10",
+        "20:00-20:10",
+    )
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "表1_指定日期购电量"
+    headers = ["日期"]
+    for interval in intervals:
+        headers.extend([f"{interval}时间段", f"{interval}购电量(kWh)"])
+    headers.extend(["全天购电量(kWh)", "全天购电费(元)"])
+    worksheet.append(headers)
+
+    for target in TARGET_DATES:
+        day = detail[detail["日期"].dt.date == target].sort_values("时段序号")
+        record: list[object] = [target.strftime("%Y-%m-%d")]
+        for interval in intervals:
+            selected = day[day["时段"] == interval]
+            if len(selected) != 1:
+                raise ValueError(f"{target}的{interval}记录不唯一。")
+            record.extend(
+                [
+                    interval,
+                    float(selected.iloc[0]["计划购电量_kWh"]),
+                ]
+            )
+        record.extend(
+            [
+                float(day["计划购电量_kWh"].sum()),
+                float(day["计划购电费_元"].sum()),
+            ]
+        )
+        worksheet.append(record)
+
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for column in range(1, len(headers) + 1):
+        worksheet.column_dimensions[get_column_letter(column)].width = 22
+    worksheet.freeze_panes = "B2"
+    workbook.save(output_path)
+    workbook.close()
+
+
+def write_table2_excel(
+    p2,
+    detail: pd.DataFrame,
+    storage,
+    output_path: Path,
+) -> None:
+    """按表2格式写出指定日期的4小时充放电量和首末储电量。"""
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "表2_指定日期充放电量"
+    worksheet.append(["日期", "时间段", "充电量(kWh)", "放电量(kWh)", "时刻", "储电量(kWh)"])
+
+    for target in TARGET_DATES:
+        day = detail[detail["日期"].dt.date == target].sort_values("时段序号")
+        charge_blocks = p2.aggregate_four_hour(
+            day["充电量_kWh"].to_numpy(dtype=float)
+        )
+        discharge_blocks = p2.aggregate_four_hour(
+            day["放电量_kWh"].to_numpy(dtype=float)
+        )
+        start_row = worksheet.max_row + 1
+        for index, block in enumerate(p2.FOUR_HOUR_BLOCKS):
+            worksheet.append(
+                [
+                    target.strftime("%Y-%m-%d") if index == 0 else None,
+                    block,
+                    charge_blocks[index],
+                    discharge_blocks[index],
+                    None,
+                    None,
+                ]
+            )
+        worksheet.cell(start_row, 5, "0:00")
+        worksheet.cell(
+            start_row,
+            6,
+            float(storage.initial_kwh),
+        )
+        worksheet.cell(start_row + 1, 5, "24:00")
+        worksheet.cell(
+            start_row + 1,
+            6,
+            float(day.iloc[-1]["时段末储电量_kWh"]),
+        )
+
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for column in range(1, 7):
+        worksheet.column_dimensions[get_column_letter(column)].width = 20
+    worksheet.freeze_panes = "A2"
+    workbook.save(output_path)
+    workbook.close()
+
+
+def write_paper_tables(
+    p2,
+    detail: pd.DataFrame,
+    storage,
+    output_dir: Path,
+) -> dict[str, object]:
+    """写出论文要求的表1、表2、表3格式工作簿。"""
+    table1 = output_dir / "表1_指定日期购电量.xlsx"
+    table2 = output_dir / "表2_指定日期充放电量.xlsx"
+    table3 = output_dir / "表3_指定日期紧急购电量.xlsx"
+    write_table1_excel(detail, table1)
+    write_table2_excel(p2, detail, storage, table2)
+    table3_data = p2.build_table3(detail)
+    p2.write_table3_excel(table3_data, table3)
+    return {
+        "表1": table1,
+        "表2": table2,
+        "表3": table3,
+        "表3明细": table3_data,
+    }
 
 
 def run_forecast_sensitivity(
@@ -299,6 +477,38 @@ def write_report(
         & (daily["日期"].dt.date <= OUTPUT_END)
     ]
     aggregate = aggregate_forecast_scenarios(scenarios.to_dict(orient="records"))
+    scenario_lookup = aggregate.set_index("情景")
+
+    def improvement(before: str, after: str, column: str) -> tuple[float, float]:
+        """返回增加更新时点后的绝对下降量和相对下降率。"""
+        before_value = float(scenario_lookup.loc[before, column])
+        after_value = float(scenario_lookup.loc[after, column])
+        absolute = before_value - after_value
+        relative = absolute / before_value * 100.0 if before_value > 0.0 else 0.0
+        return absolute, relative
+
+    cost_0_6, cost_0_6_pct = improvement("仅0:00预报", "更新至6:00", "总费用_元")
+    cost_6_12, cost_6_12_pct = improvement("更新至6:00", "更新至12:00", "总费用_元")
+    cost_12_18, cost_12_18_pct = improvement(
+        "更新至12:00",
+        "更新至18:00",
+        "总费用_元",
+    )
+    emergency_0_6, emergency_0_6_pct = improvement(
+        "仅0:00预报",
+        "更新至6:00",
+        "紧急购电量_kWh",
+    )
+    emergency_6_12, emergency_6_12_pct = improvement(
+        "更新至6:00",
+        "更新至12:00",
+        "紧急购电量_kWh",
+    )
+    emergency_12_18, emergency_12_18_pct = improvement(
+        "更新至12:00",
+        "更新至18:00",
+        "紧急购电量_kWh",
+    )
 
     def csv_block(frame: pd.DataFrame) -> str:
         """用CSV文本展示表格，避免依赖可选的tabulate包。"""
@@ -349,7 +559,21 @@ def write_report(
         csv_block(aggregate),
         "```",
         "",
-        "如果增加更新时点后总费用或紧急购电量下降，说明更新时点具有边际价值；",
+        "边际价值计算结果：",
+        "",
+        f"- 增加6:00预报：总费用下降 {cost_0_6:.6f} 元"
+        f"（{cost_0_6_pct:.4f}%），紧急购电量下降 "
+        f"{emergency_0_6:.6f} kWh（{emergency_0_6_pct:.4f}%）。",
+        f"- 增加12:00预报：总费用再下降 {cost_6_12:.6f} 元"
+        f"（{cost_6_12_pct:.4f}%），紧急购电量再下降 "
+        f"{emergency_6_12:.6f} kWh（{emergency_6_12_pct:.4f}%）。",
+        f"- 增加18:00预报：总费用再下降 {cost_12_18:.6f} 元"
+        f"（{cost_12_18_pct:.6f}%），紧急购电量再下降 "
+        f"{emergency_12_18:.6f} kWh（{emergency_12_18_pct:.6f}%）。",
+        "",
+        "结论：6:00和12:00预报产生明显的费用及紧急购电下降，应保留；"
+        "18:00预报的增量收益极小，可保留为可选更新或仅在预报显著变化时启用。",
+        "",
         "仍需关注小时预报与10分钟实际光伏的误差，因为它会造成小时内功率不匹配。",
         "",
         "## 预报整体缩放灵敏度",
@@ -386,13 +610,15 @@ def main() -> None:
     )
     print_quantity_checks(data, forecasts, "附件1电价")
 
-    output_dir = inputs["attachment1"].parent / "问题三数据处理结果"
+    # 所有代码和输出均位于“问题三”目录内；脚本可从任意当前目录启动。
+    output_dir = script_dir / "results"
     tables_dir = output_dir / "tables"
     figures_dir = output_dir / "figures"
     logs_dir = output_dir / "logs"
     for directory in (output_dir, tables_dir, figures_dir, logs_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
+    baseline = run_baseline_benchmark(p2, data, storage)
     detail, daily, scenarios = solve_problem3(p2, data, forecasts, storage)
     specified = summarize_specified_dates(daily, include_adjustment=True)
     validation = validate_result_detail(detail, storage, include_adjustment=True)
@@ -403,6 +629,12 @@ def main() -> None:
     sensitivity = run_forecast_sensitivity(p2, data, forecasts, storage)
     scenario_summary = aggregate_forecast_scenarios(
         scenarios.to_dict(orient="records")
+    )
+    paper_tables = write_paper_tables(
+        p2,
+        detail,
+        storage,
+        output_dir,
     )
 
     result_path = output_dir / "result3.xlsx"
@@ -442,6 +674,16 @@ def main() -> None:
     )
     sensitivity.to_csv(
         tables_dir / "预报灵敏度分析.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    baseline.to_csv(
+        tables_dir / "基准算例_储能不动作.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    paper_tables["表3明细"].to_csv(
+        tables_dir / "表3_指定日期紧急购电量.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -486,6 +728,8 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"result3.xlsx = {result_path}")
+    for name in ("表1", "表2", "表3"):
+        print(f"{name} = {paper_tables[name]}")
     print(f"结果目录 = {output_dir}")
     print("问题3处理完成。")
 
