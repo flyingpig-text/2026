@@ -106,6 +106,9 @@ SOC上限(kWh) = 10800.000000 kWh
 
 步骤9：输出文件
 数据预处理文件 = D:\46884\Documents\2026\题目\附件\问题一数据处理结果\问题一预处理数据.csv
+数据预处理图 = D:\46884\Documents\2026\题目\附件\问题一数据处理结果\figures\预处理_电价曲线.png
+数据预处理图 = D:\46884\Documents\2026\题目\附件\问题一数据处理结果\figures\预处理_负载光伏与净负荷功率.png
+数据预处理图 = D:\46884\Documents\2026\题目\附件\问题一数据处理结果\figures\预处理_负载光伏与净负荷电量.png
 result1.xlsx = D:\46884\Documents\2026\问题一\output\result1.xlsx
 汇总分析与检验工作簿 = D:\46884\Documents\2026\问题一\output\第一问_汇总分析与检验.xlsx
 表1 CSV = D:\46884\Documents\2026\问题一\output\tables\table1.csv

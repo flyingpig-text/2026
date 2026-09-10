@@ -1213,6 +1213,88 @@ def write_result_workbook(
     wb.close()
 
 
+def make_preprocessing_figures(
+    figure_dir: Path,
+    attachment: dict[str, object],
+) -> list[Path]:
+    """生成仅依赖原始数据的数据预处理图，不包含任何购电或储能决策量。"""
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    natural_intervals = attachment["natural_intervals"]
+    price = attachment["price"]
+    load_kw = attachment["load_kw"]
+    pv_kw = attachment["pv_kw"]
+    net_kw = load_kw - pv_kw
+    x = np.arange(T)
+    tick_positions = np.arange(0, T, 18)
+    tick_labels = [natural_intervals[index].split("-")[0] for index in tick_positions]
+    paths: list[Path] = []
+
+    fig, ax = plt.subplots(figsize=(13, 4.8))
+    ax.plot(x, price, color="#C44E52", linewidth=1.6)
+    ax.set_xlabel("时间")
+    ax.set_ylabel("电价 (元/kWh)")
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    path = figure_dir / "预处理_电价曲线.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(13, 5.0))
+    ax.plot(x, load_kw, color="#4C72B0", linewidth=1.4, label="小区负载")
+    ax.plot(x, pv_kw, color="#55A868", linewidth=1.4, label="光伏预测")
+    ax.plot(
+        x,
+        net_kw,
+        color="#8172B2",
+        linewidth=1.4,
+        linestyle="--",
+        label="净负荷",
+    )
+    ax.axhline(0.0, color="#777777", linewidth=0.8)
+    ax.set_xlabel("时间")
+    ax.set_ylabel("功率 (kW)")
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    path = figure_dir / "预处理_负载光伏与净负荷功率.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(13, 5.0))
+    ax.bar(x, load_kw * DT_H, color="#4C72B0", alpha=0.75, label="负载电量")
+    ax.bar(
+        x,
+        pv_kw * DT_H,
+        bottom=load_kw * DT_H,
+        color="#55A868",
+        alpha=0.75,
+        label="光伏电量",
+    )
+    ax.plot(x, net_kw * DT_H, color="#8172B2", linewidth=1.3, label="净负荷电量")
+    ax.axhline(0.0, color="#777777", linewidth=0.8)
+    ax.set_xlabel("时间")
+    ax.set_ylabel("电量 (kWh)")
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    path = figure_dir / "预处理_负载光伏与净负荷电量.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    paths.append(path)
+    return paths
+
+
 def make_figures(
     figure_dir: Path,
     attachment: dict[str, object],
@@ -1492,6 +1574,8 @@ def main() -> None:
         else attachment1_path.parent / "问题一数据处理结果"
     )
     preprocess_dir.mkdir(parents=True, exist_ok=True)
+    preprocess_figure_dir = preprocess_dir / "figures"
+    preprocess_figure_dir.mkdir(parents=True, exist_ok=True)
     figure_dir = output_dir / "figures"
     table_dir = output_dir / "tables"
     log_dir = output_dir / "logs"
@@ -1510,6 +1594,10 @@ def main() -> None:
     attachment = read_attachment1(attachment1_path)
     preprocessed_path = preprocess_dir / "问题一预处理数据.csv"
     write_preprocessed_data(preprocessed_path, attachment)
+    preprocessing_figure_paths = make_preprocessing_figures(
+        preprocess_figure_dir,
+        attachment,
+    )
     preprocessed = read_preprocessed_data(preprocessed_path)
     np.testing.assert_allclose(
         preprocessed["price"],
@@ -1721,6 +1809,8 @@ def main() -> None:
     log("")
     log("步骤9：输出文件")
     log(f"数据预处理文件 = {preprocessed_path}")
+    for path in preprocessing_figure_paths:
+        log(f"数据预处理图 = {path}")
     log(f"result1.xlsx = {result_path}")
     log(f"汇总分析与检验工作簿 = {analysis_workbook_path}")
     log(f"表1 CSV = {table_dir / 'table1.csv'}")
