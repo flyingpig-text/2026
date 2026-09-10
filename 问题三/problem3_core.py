@@ -1054,7 +1054,9 @@ def validate_result_detail(
                 + day["光伏实际_kW"].to_numpy(dtype=float) * DT_H
                 + discharge
             )
-            balance = available - required
+            # 问题2口径允许实际光伏过剩时弃光，因此平衡残差必须扣除弃光量。
+            curtail = day["实际弃光量_kWh"].to_numpy(dtype=float)
+            balance = available - required - curtail
             max_balance_error = max(
                 max_balance_error,
                 float(np.max(np.abs(balance))),

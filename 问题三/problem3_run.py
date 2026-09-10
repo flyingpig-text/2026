@@ -154,8 +154,7 @@ def solve_problem3(
     print(f"问题3开始求解：{len(dates)}天，每天144个10分钟时段。")
     for number, current_date in enumerate(dates, start=1):
         day = data[data["日期"].dt.date == current_date].sort_values("时段序号")
-        result = run_rolling_day(
-            p2,
+        rolling = run_rolling_day(
             load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
             actual_pv_energy_kwh=day["光伏实际电量_kWh"].to_numpy(dtype=float),
             price_yuan_per_kwh=day["电价_元每kWh"].to_numpy(dtype=float),
@@ -163,6 +162,7 @@ def solve_problem3(
             storage=storage,
             settlement_mode=settlement_mode,
         )
+        result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
         rows, daily = dataframe_row_for_day(current_date, data, result)
         detail_rows.extend(rows)
         daily_rows.append(daily)
@@ -387,8 +387,7 @@ def run_forecast_sensitivity(
     for target in TARGET_DATES:
         day = data[data["日期"].dt.date == target].sort_values("时段序号")
         for scale in (0.90, 0.95, 1.00, 1.05, 1.10):
-            result = run_rolling_day(
-                p2,
+            rolling = run_rolling_day(
                 load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
                 actual_pv_energy_kwh=day["光伏实际电量_kWh"].to_numpy(dtype=float),
                 price_yuan_per_kwh=day["电价_元每kWh"].to_numpy(dtype=float),
@@ -397,6 +396,7 @@ def run_forecast_sensitivity(
                 forecast_scale=scale,
                 settlement_mode=settlement_mode,
             )
+            result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             rows.append(
                 {
                     "日期": target,

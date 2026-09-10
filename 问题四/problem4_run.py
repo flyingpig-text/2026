@@ -61,6 +61,76 @@ plt.rcParams["font.sans-serif"] = [
 plt.rcParams["axes.unicode_minus"] = False
 
 
+def run_baseline_benchmark(
+    p2,
+    data: pd.DataFrame,
+    storage,
+) -> pd.DataFrame:
+    """
+    先运行简单基准算例：储能不动作，实际净负荷全部由计划购电满足。
+
+    该算例只用于验证附件读取、10分钟电量换算和电能平衡，不参与最终优化。
+    """
+    rows: list[dict[str, object]] = []
+    print("问题4步骤1：运行储能不动作基准算例。")
+    for target in TARGET_DATES:
+        day = data[data["日期"].dt.date == target].sort_values("时段序号")
+        load = day["小区负载电量_kWh"].to_numpy(dtype=float)
+        pv = day["光伏实际电量_kWh"].to_numpy(dtype=float)
+        price = day["电价_元每kWh"].to_numpy(dtype=float)
+        dispatch = p2.baseline_day(load, pv, price, storage.initial_kwh)
+        balance_error = (
+            dispatch.planned_purchase_kwh
+            + pv
+            + dispatch.discharge_kwh
+            - load
+            - dispatch.charge_kwh
+            - dispatch.curtail_kwh
+        )
+        rows.append(
+            {
+                "日期": target,
+                "基准计划购电量_kWh": float(
+                    dispatch.planned_purchase_kwh.sum()
+                ),
+                "基准购电费_元": float(dispatch.total_cost_yuan),
+                "最大电能平衡残差_kWh": float(
+                    np.max(np.abs(balance_error))
+                ),
+            }
+        )
+        print(
+            f"{target}：计划购电量="
+            f"{dispatch.planned_purchase_kwh.sum():.6f} kWh，"
+            f"购电费={dispatch.total_cost_yuan:.6f} 元，"
+            f"最大平衡残差={np.max(np.abs(balance_error)):.3e} kWh。"
+        )
+    result = pd.DataFrame(rows)
+    result["日期"] = pd.to_datetime(result["日期"])
+    return result
+
+
+def build_fixed_price_data(
+    p2,
+    data: pd.DataFrame,
+    attachment1_path: Path,
+) -> pd.DataFrame:
+    """
+    用附件1的日内电价曲线覆盖每天电价，构造固定电价基准数据。
+
+    问题2、问题3使用同一附件1电价曲线，因此全年每天的144个
+    电价点相同。该函数只复制附件1已有数据，不产生新参数。
+    """
+    fixed_price = p2.read_price_curve(attachment1_path)
+    dates = data["日期"].dt.normalize().drop_duplicates()
+    fixed_values = np.tile(fixed_price, len(dates))
+    if len(fixed_values) != len(data):
+        raise ValueError("固定电价数据长度与附件2记录数不一致。")
+    result = data.copy()
+    result["电价_元每kWh"] = fixed_values
+    return result
+
+
 def run_volatile_price_sensitivity(
     p2,
     data: pd.DataFrame,
@@ -76,8 +146,7 @@ def run_volatile_price_sensitivity(
         load = day["小区负载电量_kWh"].to_numpy(dtype=float)
         actual_pv = day["光伏实际电量_kWh"].to_numpy(dtype=float)
         for scale in (0.90, 0.95, 1.00, 1.05, 1.10):
-            result = run_rolling_day(
-                p2,
+            rolling = run_rolling_day(
                 load,
                 actual_pv,
                 base_price,
@@ -85,6 +154,7 @@ def run_volatile_price_sensitivity(
                 storage,
                 forecast_scale=scale,
             )
+            result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             forecast_rows.append(
                 {
                     "日期": target,
@@ -99,13 +169,15 @@ def run_volatile_price_sensitivity(
                     "总费用_元": float(result["total_cost_yuan"]),
                 }
             )
-            price_result = run_rolling_day(
-                p2,
+            rolling = run_rolling_day(
                 load,
                 actual_pv,
                 base_price * scale,
                 forecasts[target],
                 storage,
+            )
+            price_result = (
+                rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             )
             price_rows.append(
                 {
@@ -128,6 +200,145 @@ def run_volatile_price_sensitivity(
     forecast_frame["日期"] = pd.to_datetime(forecast_frame["日期"])
     price_frame["日期"] = pd.to_datetime(price_frame["日期"])
     return forecast_frame, price_frame
+
+
+def build_regime_comparison_table(
+    daily2_fixed: pd.DataFrame,
+    daily3_fixed: pd.DataFrame,
+    daily42: pd.DataFrame,
+    daily43: pd.DataFrame,
+) -> pd.DataFrame:
+    """汇总问题2、3与问题4-2、4-3的全年费用和购电量差异。"""
+    rows = [
+        {
+            "模型": "问题2",
+            "电价情景": "附件1固定日内电价",
+            "预测信息": "实际负荷、实际光伏",
+            "计划购电量_kWh": float(daily2_fixed["计划购电量_kWh"].sum()),
+            "调整购电量_kWh": np.nan,
+            "紧急购电量_kWh": float(daily2_fixed["紧急购电量_kWh"].sum()),
+            "总费用_元": float(daily2_fixed["总费用_元"].sum()),
+        },
+        {
+            "模型": "问题4-2",
+            "电价情景": "附件4实时波动电价",
+            "预测信息": "实际负荷、实际光伏",
+            "计划购电量_kWh": float(daily42["计划购电量_kWh"].sum()),
+            "调整购电量_kWh": np.nan,
+            "紧急购电量_kWh": float(daily42["紧急购电量_kWh"].sum()),
+            "总费用_元": float(daily42["总费用_元"].sum()),
+        },
+        {
+            "模型": "问题3",
+            "电价情景": "附件1固定日内电价",
+            "预测信息": "附件3滚动光伏预报",
+            "计划购电量_kWh": float(daily3_fixed["计划购电量_kWh"].sum()),
+            "调整购电量_kWh": float(daily3_fixed["调整购电量_kWh"].sum()),
+            "紧急购电量_kWh": float(daily3_fixed["紧急购电量_kWh"].sum()),
+            "总费用_元": float(daily3_fixed["总费用_元"].sum()),
+        },
+        {
+            "模型": "问题4-3",
+            "电价情景": "附件4实时波动电价",
+            "预测信息": "附件3滚动光伏预报",
+            "计划购电量_kWh": float(daily43["计划购电量_kWh"].sum()),
+            "调整购电量_kWh": float(daily43["调整购电量_kWh"].sum()),
+            "紧急购电量_kWh": float(daily43["紧急购电量_kWh"].sum()),
+            "总费用_元": float(daily43["总费用_元"].sum()),
+        },
+    ]
+    comparison = pd.DataFrame(rows)
+    fixed_cost_by_model = {
+        "问题2": float(comparison.loc[0, "总费用_元"]),
+        "问题4-2": float(comparison.loc[0, "总费用_元"]),
+        "问题3": float(comparison.loc[2, "总费用_元"]),
+        "问题4-3": float(comparison.loc[2, "总费用_元"]),
+    }
+    baseline_cost = comparison["模型"].map(fixed_cost_by_model)
+    comparison["相对固定电价费用变化_元"] = (
+        comparison["总费用_元"] - baseline_cost
+    )
+    comparison["相对固定电价费用变化_百分比"] = np.where(
+        baseline_cost.to_numpy(dtype=float) != 0.0,
+        100.0
+        * comparison["相对固定电价费用变化_元"].to_numpy(dtype=float)
+        / baseline_cost.to_numpy(dtype=float),
+        np.nan,
+    )
+    return comparison
+
+
+def build_strategy_metrics(
+    fixed_detail42: pd.DataFrame,
+    fixed_detail43: pd.DataFrame,
+    detail42: pd.DataFrame,
+    detail43: pd.DataFrame,
+) -> pd.DataFrame:
+    """计算充电、放电、紧急购电和费用结构指标。"""
+    records: list[dict[str, object]] = []
+    scenarios = [
+        ("问题2", "附件1固定日内电价", fixed_detail42),
+        ("问题4-2", "附件4实时波动电价", detail42),
+        ("问题3", "附件1固定日内电价", fixed_detail43),
+        ("问题4-3", "附件4实时波动电价", detail43),
+    ]
+    for model_name, price_name, frame in scenarios:
+        price = frame["电价_元每kWh"].to_numpy(dtype=float)
+        charge = frame["充电量_kWh"].to_numpy(dtype=float)
+        discharge = frame["放电量_kWh"].to_numpy(dtype=float)
+        emergency = frame["紧急购电量_kWh"].to_numpy(dtype=float)
+        low_threshold = float(np.quantile(price, 0.25))
+        high_threshold = float(np.quantile(price, 0.75))
+        total_charge = float(charge.sum())
+        total_discharge = float(discharge.sum())
+        charge_price = (
+            float(np.average(price, weights=charge))
+            if total_charge > 0.0
+            else np.nan
+        )
+        discharge_price = (
+            float(np.average(price, weights=discharge))
+            if total_discharge > 0.0
+            else np.nan
+        )
+        records.append(
+            {
+                "模型": model_name,
+                "电价情景": price_name,
+                "充电量_kWh": total_charge,
+                "放电量_kWh": total_discharge,
+                "充电加权电价_元每kWh": charge_price,
+                "放电加权电价_元每kWh": discharge_price,
+                "充放电价差_元每kWh": discharge_price - charge_price,
+                "低价充电占比_百分比": (
+                    100.0
+                    * float(charge[price <= low_threshold].sum())
+                    / total_charge
+                    if total_charge > 0.0
+                    else np.nan
+                ),
+                "高价放电占比_百分比": (
+                    100.0
+                    * float(discharge[price >= high_threshold].sum())
+                    / total_discharge
+                    if total_discharge > 0.0
+                    else np.nan
+                ),
+                "计划购电费_元": float(
+                    frame["计划购电费_元"].sum()
+                ),
+                "调整费用_元": float(frame["调整费用_元"].sum()),
+                "紧急购电费_元": float(frame["紧急购电费_元"].sum()),
+                "总费用_元": float(
+                    frame[
+                        ["计划购电费_元", "调整费用_元", "紧急购电费_元"]
+                    ].to_numpy(dtype=float).sum()
+                ),
+                "紧急购电量_kWh": float(emergency.sum()),
+                "紧急购电时段数": int(np.count_nonzero(emergency > 1e-8)),
+            }
+        )
+    return pd.DataFrame(records)
 
 
 def plot_prices(
@@ -235,6 +446,8 @@ def write_report(
     output_path: Path,
     detail42: pd.DataFrame,
     daily42: pd.DataFrame,
+    comparison: pd.DataFrame,
+    strategy_metrics: pd.DataFrame,
     daily43: pd.DataFrame,
     specified42: pd.DataFrame,
     specified43: pd.DataFrame,
@@ -259,6 +472,32 @@ def write_report(
         "紧急购电量_kWh": daily43["紧急购电量_kWh"].sum(),
         "总费用_元": daily43["总费用_元"].sum(),
     }
+    row = comparison.set_index("模型")
+    metric = strategy_metrics.set_index("模型")
+    delta_42 = float(row.loc["问题4-2", "相对固定电价费用变化_元"])
+    delta_42_pct = float(
+        row.loc["问题4-2", "相对固定电价费用变化_百分比"]
+    )
+    delta_43 = float(row.loc["问题4-3", "相对固定电价费用变化_元"])
+    delta_43_pct = float(
+        row.loc["问题4-3", "相对固定电价费用变化_百分比"]
+    )
+    rolling_saving = float(
+        scenario_summary.iloc[0]["总费用_元"]
+        - scenario_summary.iloc[-1]["总费用_元"]
+    )
+    charge_42_change = float(
+        metric.loc["问题4-2", "充电量_kWh"]
+        - metric.loc["问题2", "充电量_kWh"]
+    )
+    discharge_42_change = float(
+        metric.loc["问题4-2", "放电量_kWh"]
+        - metric.loc["问题2", "放电量_kWh"]
+    )
+    emergency_43_change = float(
+        metric.loc["问题4-3", "紧急购电量_kWh"]
+        - metric.loc["问题3", "紧急购电量_kWh"]
+    )
     lines = [
         "# 问题4结果说明",
         "",
@@ -267,7 +506,7 @@ def write_report(
         "- 附件4电价按对应日期和10分钟时段逐点使用。",
         "- 问题4-2按问题2口径，使用附件2实际光伏制定计划，紧急购电为零。",
         "- 问题4-3按问题3口径，使用附件3预报并允许6:00、12:00、18:00滚动调整。",
-        "- 每天0:00和24:00储电量均为6000 kWh。",
+        "- 沿用问题2、问题3既有模型的日循环储能口径，每天0:00和24:00储电量均为6000 kWh。",
         "",
         "## 储能参数",
         "",
@@ -289,6 +528,20 @@ def write_report(
         f"{total_43['总费用_元']:.6f} |",
         "",
         "## 指定日期结果",
+        "",
+        "### 问题2、3与问题4-2、4-3全年费用对比",
+        "",
+        "```text",
+        csv_block(comparison),
+        "```",
+        "",
+        "### 充放电与紧急购电指标",
+        "",
+        "```text",
+        csv_block(strategy_metrics),
+        "```",
+        "",
+        "### 问题4-2指定日期结果",
         "",
         "```text",
         csv_block(specified42),
@@ -318,9 +571,34 @@ def write_report(
         csv_block(price_sensitivity),
         "```",
         "",
-        "结论：如果滚动预报更新后总费用下降，且紧急购电量减少，则说明6:00、12:00、18:00",
-        "的更新具有实际价值。是否还需要增加其他时刻，应看增加更新后费用和紧急购电量的边际下降量；",
-        "当前附件只提供这4个预报时点，因此其他时刻的预测效果无法用附件数据直接验证。",
+        "## 结论",
+        "",
+        f"1. 实时电价使问题4-2总费用比问题2增加 {delta_42:.6f} 元，"
+        f"增幅 {delta_42_pct:.6f}%；计划购电量变化很小，费用变化主要来自"
+        "逐10分钟电价水平及峰谷价差。",
+        f"2. 实时电价使问题4-3总费用比问题3增加 {delta_43:.6f} 元，"
+        f"增幅 {delta_43_pct:.6f}%；紧急购电量基本不变，说明费用上升主要"
+        "由电价数值变化而不是额外供电缺口造成。",
+        f"3. 问题4-2充电加权电价为 "
+        f"{float(metric.loc['问题4-2', '充电加权电价_元每kWh']):.6f} 元/kWh，"
+        f"放电加权电价为 "
+        f"{float(metric.loc['问题4-2', '放电加权电价_元每kWh']):.6f} 元/kWh；"
+        f"低价区间充电量占比 "
+        f"{float(metric.loc['问题4-2', '低价充电占比_百分比']):.6f}%，"
+        f"高价区间放电量占比 "
+        f"{float(metric.loc['问题4-2', '高价放电占比_百分比']):.6f}%，"
+        "说明储能仍遵循低价充电、高价放电策略。",
+        f"4. 相较固定电价，问题4-2充电量增加 {charge_42_change:.6f} kWh，"
+        f"放电量增加 {discharge_42_change:.6f} kWh；电价峰谷价差扩大后，"
+        "储能套利空间增加。",
+        f"5. 问题4-3紧急购电量比问题3增加 {emergency_43_change:.6f} kWh，"
+        "变化率不足0.1%，说明实时电价主要改变购电价格和充放电时机，"
+        "没有显著扩大预测误差造成的供电缺口。",
+        f"6. 问题4-3从仅使用0:00预报到使用18:00前滚动更新，总费用下降 "
+        f"{rolling_saving:.6f} 元；6:00、12:00、18:00 的更新均未增加费用，"
+        "其中12:00后的更新对紧急购电下降贡献最明显。",
+        "7. 仅有附件3给出的四个预报时点可用于滚动验证，因此不能从现有附件"
+        "直接证明增加其他预报时刻一定有效。",
     ]
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -335,13 +613,16 @@ def main() -> None:
     forecasts = read_attachment3(inputs["attachment3"])
     price_by_date = read_price_matrix(inputs["attachment4"])
     data = prepare_actual_data(p2, inputs["attachment2"], price_by_date)
+    fixed_data = build_fixed_price_data(p2, data, inputs["attachment1"])
 
     print("问题4附件路径：")
     for key, value in inputs.items():
         print(f"{key} = {value}")
     print_quantity_checks(data, forecasts, "附件4电价")
+    benchmark = run_baseline_benchmark(p2, data, storage)
 
-    output_dir = inputs["attachment1"].parent / "问题四数据处理结果"
+    # 输出目录固定为脚本所在目录下的 output，所有输出路径均由 __file__ 推导。
+    output_dir = script_dir / "output"
     tables_dir = output_dir / "tables"
     figures_dir = output_dir / "figures"
     for directory in (output_dir, tables_dir, figures_dir):
@@ -369,6 +650,42 @@ def main() -> None:
         include_adjustment=True,
     )
     specified43 = summarize_specified_dates(daily43, include_adjustment=True)
+
+    # 在同一储能和费用口径下重算问题2、3固定电价基准，保证对比可复现。
+    print("问题4步骤2：重算问题2、问题3固定电价基准。")
+    fixed_detail42, fixed_daily42 = build_plan_only_result(
+        p2,
+        fixed_data,
+        storage,
+    )
+    validation_fixed42 = validate_result_detail(
+        fixed_detail42,
+        storage,
+        include_adjustment=False,
+    )
+    fixed_detail43, fixed_daily43, _ = solve_problem3(
+        p2,
+        fixed_data,
+        forecasts,
+        storage,
+    )
+    validation_fixed43 = validate_result_detail(
+        fixed_detail43,
+        storage,
+        include_adjustment=True,
+    )
+    comparison = build_regime_comparison_table(
+        fixed_daily42,
+        fixed_daily43,
+        daily42,
+        daily43,
+    )
+    strategy_metrics = build_strategy_metrics(
+        fixed_detail42,
+        fixed_detail43,
+        detail42,
+        detail43,
+    )
     scenario_summary = aggregate_forecast_scenarios(
         scenarios43.to_dict(orient="records")
     )
@@ -378,7 +695,7 @@ def main() -> None:
         forecasts,
         storage,
     )
-    comparison = build_comparison_table(specified42, specified43)
+    specified_comparison = build_comparison_table(specified42, specified43)
 
     result42_path = output_dir / "result4-2.xlsx"
     result43_path = output_dir / "result4-3.xlsx"
@@ -450,10 +767,31 @@ def main() -> None:
         encoding="utf-8-sig",
     )
     comparison.to_csv(
+        tables_dir / "问题2_3与问题4_2_4_3_费用对比.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    strategy_metrics.to_csv(
+        tables_dir / "问题2_3与问题4_2_4_3_策略指标.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    specified_comparison.to_csv(
         tables_dir / "指定日期_问题4-2与4-3对比.csv",
         index=False,
         encoding="utf-8-sig",
     )
+    with pd.ExcelWriter(
+        output_dir / "问题2_3与问题4_2_4_3_对比.xlsx",
+        engine="openpyxl",
+    ) as writer:
+        comparison.to_excel(writer, sheet_name="全年费用对比", index=False)
+        strategy_metrics.to_excel(writer, sheet_name="策略指标", index=False)
+        specified_comparison.to_excel(
+            writer,
+            sheet_name="指定日期对比",
+            index=False,
+        )
 
     plot_prices(data, figures_dir / "指定日期_波动电价.png")
     plot_forecast_and_dispatch(
@@ -479,6 +817,8 @@ def main() -> None:
         output_dir / "问题四_结果说明.md",
         detail42,
         daily42,
+        comparison,
+        strategy_metrics,
         daily43,
         specified42,
         specified43,
@@ -502,7 +842,13 @@ def main() -> None:
         "约束校验": {
             "问题4-2": validation42,
             "问题4-3": validation43,
+            "固定电价问题2": validation_fixed42,
+            "固定电价问题3": validation_fixed43,
         },
+        "问题2_3与问题4费用对比": comparison.to_dict(orient="records"),
+        "充放电与紧急购电策略指标": strategy_metrics.to_dict(
+            orient="records"
+        ),
     }
     (tables_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -511,6 +857,11 @@ def main() -> None:
     print(f"result4-2.xlsx = {result42_path}")
     print(f"result4-3.xlsx = {result43_path}")
     print(f"结果目录 = {output_dir}")
+    benchmark.to_csv(
+        tables_dir / "基准算例_指定日期.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     print("问题4处理完成。")
 
 

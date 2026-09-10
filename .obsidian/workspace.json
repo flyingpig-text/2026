@@ -1,0 +1,216 @@
+{
+  "main": {
+    "id": "a0b0431c8cc5c7e2",
+    "type": "split",
+    "children": [
+      {
+        "id": "bc7d43b8e2bb6919",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "6e880b2aa7c088cd",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "第四问_时变MILP_滚动MILP_LP推导与检验"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "e3af1d5f430e2602",
+    "type": "split",
+    "children": [
+      {
+        "id": "0fc89a37b07b93df",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "d28585f6823c5db0",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "9a58af1e1550388d",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "f2fec4b5447cc48b",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "d26b382e577dd15e",
+    "type": "split",
+    "children": [
+      {
+        "id": "725779278d41c114",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "140858941630d6ac",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "反向链接"
+            }
+          },
+          {
+            "id": "d17c58743e8a79bb",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "出链"
+            }
+          },
+          {
+            "id": "85dbda6735f5cc39",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "52474cc5876d302d",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          },
+          {
+            "id": "2ff56898ca52dfd3",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "6e880b2aa7c088cd",
+  "lastOpenFiles": [
+    "问题四/问题四_数学模型与运行说明.md",
+    "问题四/output/问题2_3与问题4_2_4_3_对比.xlsx",
+    "问题四/output/tables/问题2_3与问题4_2_4_3_策略指标.csv",
+    "问题四/output/tables/基准算例_指定日期.csv",
+    "问题四/output/tables/summary.json",
+    "问题四/output/问题四_结果说明.md",
+    "问题四/output/figures/问题4-2与4-3_费用与紧急购电对比.png",
+    "问题四/output/figures/问题4-3_预报更新时点_边际价值.png",
+    "问题四/output/figures/问题4-3_指定日期_储能充放电与储电量.png",
+    "问题四/output/figures/问题4-3_指定日期_预报更新与购电调整.png",
+    "问题四/output/figures/指定日期_波动电价.png",
+    "问题四/output/tables/指定日期_问题4-2与4-3对比.csv",
+    "问题四/output/tables/问题2_3与问题4_2_4_3_费用对比.csv",
+    "问题四/output/tables/问题4-3_电价缩放灵敏度.csv",
+    "问题四/output/tables/问题4-3_预报缩放灵敏度.csv",
+    "问题四/output/tables/问题4-3_预报更新情景汇总.csv",
+    "问题四/output/tables/问题4-3_预报更新情景逐日.csv",
+    "各题模型/第四问_关键约束与建模方法(1).md",
+    "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
+    "各题模型/第二问_建模分析.md",
+    "各题模型/第一问_关键约束与输出要求.md",
+    "各题模型/第一问_MILP建模分析.md"
+  ]
+}
