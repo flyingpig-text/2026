@@ -12,12 +12,16 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 from PIL import Image
+
+from problem3_core import merge_contiguous_emergency_events
 
 
 TOL = 1e-6
@@ -97,8 +101,20 @@ def read_wide_sheet(sheet) -> tuple[list[str], list, np.ndarray, np.ndarray, np.
 
 def main() -> None:
     """执行全部结果质量检查。"""
+    parser = argparse.ArgumentParser(description="问题3结果质量检查")
+    parser.add_argument(
+        "--result-dir",
+        type=Path,
+        default=None,
+        help="待检查结果目录；默认问题三/results。",
+    )
+    args = parser.parse_args()
     script_dir = Path(__file__).resolve().parent
-    result_dir = script_dir / "results"
+    result_dir = (
+        args.result_dir.expanduser().resolve()
+        if args.result_dir is not None
+        else script_dir / "results"
+    )
     detail_path = result_dir / "tables" / "逐10分钟计划调整明细.csv"
     result3_path = result_dir / "result3.xlsx"
     table1_path = result_dir / "表1_指定日期购电量.xlsx"
@@ -118,6 +134,9 @@ def main() -> None:
         verification.check(path.is_file(), f"文件存在：{path.name}")
 
     detail = pd.read_csv(detail_path, encoding="utf-8-sig", parse_dates=["日期"])
+    summary_path = result_dir / "tables" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    settlement_mode = summary.get("费用结算口径", "plan_full")
     detail["日期"] = pd.to_datetime(detail["日期"])
     detail = detail.sort_values(["日期", "时段序号"]).reset_index(drop=True)
     detail_dates = sorted(detail["日期"].dt.date.unique())
@@ -268,9 +287,7 @@ def main() -> None:
     verification.check(charge_ok, "充放电量工作表与明细4小时聚合一致", charge_detail)
     verification.check(soc_ok, "充放电量工作表0:00和24:00储电量正确")
 
-    emergency_detail = detail[detail["紧急购电量_kWh"] > 1e-8].sort_values(
-        ["日期", "时段序号"]
-    )
+    emergency_detail = merge_contiguous_emergency_events(detail)
     verification.check(
         len(emergency_rows) == 1 + len(emergency_detail),
         "紧急购电量事件行数完整",
@@ -281,7 +298,7 @@ def main() -> None:
     for row, expected in zip(emergency_rows[1:], emergency_detail.itertuples(index=False)):
         if (
             pd.Timestamp(row[0]).date() != expected.日期.date()
-            or row[1] != expected.时段
+            or row[1] != expected.紧急购电时间段
             or not close_enough(float(row[2]), float(expected.紧急购电量_kWh))
         ):
             emergency_ok = False
@@ -319,19 +336,40 @@ def main() -> None:
         close_enough(adjusted_cost.sum(), total_adjustment_cost),
         "全年调整费用由逐日明细反算一致",
     )
+    expected_total_cost = (
+        16609954.260720413
+        if settlement_mode == "plan_full"
+        else float(summary["输出期"]["总费用_元"])
+    )
     verification.check(
-        close_enough(total_cost, 16609954.260720413, tolerance=1e-5),
+        close_enough(total_cost, expected_total_cost, tolerance=1e-5),
         "三类费用之和等于总费用",
         f"反算总费用={total_cost:.6f} 元",
     )
 
-    table1_rows = list(
-        load_workbook(table1_path, read_only=True, data_only=True)["表1_指定日期购电量"].iter_rows(
-            values_only=True
-        )
+    table1_book = load_workbook(table1_path, read_only=True, data_only=True)
+    plan_table_rows = list(
+        table1_book["表1_计划购电量"].iter_rows(values_only=True)
     )
-    table1_ok = len(table1_rows) == 5 and len(table1_rows[0]) == 15
-    table1_message = f"行列数={len(table1_rows)}×{len(table1_rows[0])}"
+    final_table_rows = list(
+        table1_book["表1_最终购电量"].iter_rows(values_only=True)
+    )
+    comparison_rows = list(
+        table1_book["计划调整对照"].iter_rows(values_only=True)
+    )
+    table1_ok = (
+        len(plan_table_rows) == 5
+        and len(plan_table_rows[0]) == 15
+        and len(final_table_rows) == 5
+        and len(final_table_rows[0]) == 15
+        and len(comparison_rows) == 25
+        and len(comparison_rows[0]) == 6
+    )
+    table1_message = (
+        f"计划表={len(plan_table_rows)}×{len(plan_table_rows[0])}，"
+        f"最终表={len(final_table_rows)}×{len(final_table_rows[0])}，"
+        f"对照表={len(comparison_rows)}×{len(comparison_rows[0])}"
+    )
     if table1_ok:
         intervals = (
             "10:00-10:10",
@@ -341,23 +379,64 @@ def main() -> None:
             "18:00-18:10",
             "20:00-20:10",
         )
-        for row, target in zip(table1_rows[1:], TARGET_DATES):
+        for row_plan, row_final, target in zip(
+            plan_table_rows[1:],
+            final_table_rows[1:],
+            TARGET_DATES,
+        ):
             day = detail_by_day[target]
-            expected_values = [
+            expected_plan_values = [
                 float(day[day["时段"] == interval].iloc[0]["计划购电量_kWh"])
                 for interval in intervals
             ]
-            actual_values = [float(row[2 + 2 * index]) for index in range(6)]
+            expected_final_values = [
+                float(day[day["时段"] == interval].iloc[0]["调整购电量_kWh"])
+                for interval in intervals
+            ]
+            actual_plan_values = [
+                float(row_plan[2 + 2 * index]) for index in range(6)
+            ]
+            actual_final_values = [
+                float(row_final[2 + 2 * index]) for index in range(6)
+            ]
+            expected_total_cost = float(
+                day[
+                    ["计划购电费_元", "调整费用_元", "紧急购电费_元"]
+                ].to_numpy(dtype=float).sum()
+            )
             if (
-                pd.Timestamp(row[0]).date() != target
-                or not arrays_close(np.asarray(actual_values), np.asarray(expected_values))
-                or not close_enough(float(row[13]), float(day["计划购电量_kWh"].sum()))
-                or not close_enough(float(row[14]), float(day["计划购电费_元"].sum()))
+                pd.Timestamp(row_plan[0]).date() != target
+                or pd.Timestamp(row_final[0]).date() != target
+                or not arrays_close(
+                    np.asarray(actual_plan_values),
+                    np.asarray(expected_plan_values),
+                )
+                or not arrays_close(
+                    np.asarray(actual_final_values),
+                    np.asarray(expected_final_values),
+                )
+                or not close_enough(
+                    float(row_plan[13]),
+                    float(day["计划购电量_kWh"].sum()),
+                )
+                or not close_enough(
+                    float(row_plan[14]),
+                    float(day["计划购电费_元"].sum()),
+                )
+                or not close_enough(
+                    float(row_final[13]),
+                    float(day["调整购电量_kWh"].sum()),
+                )
+                or not close_enough(float(row_final[14]), expected_total_cost)
             ):
                 table1_ok = False
                 table1_message = f"不一致日期={target}"
                 break
-    verification.check(table1_ok, "表1格式及指定日期数值正确", table1_message)
+    verification.check(
+        table1_ok,
+        "表1计划、最终购电量及调整对照均正确",
+        table1_message,
+    )
 
     table2_rows = list(
         load_workbook(table2_path, read_only=True, data_only=True)["表2_指定日期充放电量"].iter_rows(
@@ -436,7 +515,7 @@ def main() -> None:
                 break
             for actual_row, expected_row in zip(actual, expected.itertuples(index=False)):
                 if (
-                    actual_row[1 + 2 * index] != expected_row.时段
+                    actual_row[1 + 2 * index] != expected_row.紧急购电时间段
                     or not close_enough(
                         float(actual_row[2 + 2 * index]),
                         float(expected_row.紧急购电量_kWh),

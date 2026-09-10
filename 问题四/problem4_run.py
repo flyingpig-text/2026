@@ -35,12 +35,12 @@ from problem3_core import (  # noqa: E402
     print_quantity_checks,
     read_attachment3,
     read_price_matrix,
-    run_rolling_day,
     summarize_specified_dates,
     validate_result_detail,
     write_official_result,
     write_specified_date_workbook,
 )
+from problem3_algorithm import run_rolling_day  # noqa: E402
 from problem3_run import (  # noqa: E402
     aggregate_forecast_scenarios,
     configure_console,

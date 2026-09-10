@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -26,21 +27,23 @@ from problem3_core import (
     DT_H,
     OUTPUT_END,
     OUTPUT_START,
+    SETTLEMENT_MODES,
     T,
     TARGET_DATES,
     aggregate_forecast_scenarios,
     dataframe_row_for_day,
     load_problem2_module,
     locate_inputs,
+    merge_contiguous_emergency_events,
     prepare_actual_data,
     print_quantity_checks,
     read_attachment3,
-    run_rolling_day,
     summarize_specified_dates,
     validate_result_detail,
     write_official_result,
     write_specified_date_workbook,
 )
+from problem3_algorithm import run_rolling_day
 
 
 plt.rcParams["font.sans-serif"] = [
@@ -59,6 +62,27 @@ def configure_console() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    """解析费用口径和输出目录参数。"""
+    parser = argparse.ArgumentParser(description="2026 C题问题3滚动优化")
+    parser.add_argument(
+        "--settlement-mode",
+        choices=SETTLEMENT_MODES,
+        default="plan_full",
+        help=(
+            "plan_full：计划购电量始终按正常电价结算；"
+            "actual_base：正常电价只结算min(计划购电量,调整购电量)。"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="结果目录；默认写入问题三/results。",
+    )
+    return parser.parse_args()
 
 
 def output_dates(data: pd.DataFrame) -> list[date]:
@@ -120,6 +144,7 @@ def solve_problem3(
     data: pd.DataFrame,
     forecasts: dict[date, dict[int, np.ndarray]],
     storage,
+    settlement_mode: str = "plan_full",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """逐日运行0:00计划和滚动调整。"""
     detail_rows: list[dict[str, object]] = []
@@ -136,6 +161,7 @@ def solve_problem3(
             price_yuan_per_kwh=day["电价_元每kWh"].to_numpy(dtype=float),
             forecast_by_hour=forecasts[current_date],
             storage=storage,
+            settlement_mode=settlement_mode,
         )
         rows, daily = dataframe_row_for_day(current_date, data, result)
         detail_rows.extend(rows)
@@ -163,7 +189,7 @@ def write_table1_excel(
     detail: pd.DataFrame,
     output_path: Path,
 ) -> None:
-    """按表1格式写出指定日期的购电量和全天费用。"""
+    """按表1格式写出计划购电量、最终购电量和调整对照。"""
     intervals = (
         "10:00-10:10",
         "12:00-12:10",
@@ -173,13 +199,13 @@ def write_table1_excel(
         "20:00-20:10",
     )
     workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "表1_指定日期购电量"
+    plan_sheet = workbook.active
+    plan_sheet.title = "表1_计划购电量"
     headers = ["日期"]
     for interval in intervals:
         headers.extend([f"{interval}时间段", f"{interval}购电量(kWh)"])
     headers.extend(["全天购电量(kWh)", "全天购电费(元)"])
-    worksheet.append(headers)
+    plan_sheet.append(headers)
 
     for target in TARGET_DATES:
         day = detail[detail["日期"].dt.date == target].sort_values("时段序号")
@@ -200,14 +226,74 @@ def write_table1_excel(
                 float(day["计划购电费_元"].sum()),
             ]
         )
-        worksheet.append(record)
+        plan_sheet.append(record)
 
-    for cell in worksheet[1]:
+    final_sheet = workbook.create_sheet("表1_最终购电量")
+    final_sheet.append(headers)
+    for target in TARGET_DATES:
+        day = detail[detail["日期"].dt.date == target].sort_values("时段序号")
+        record = [target.strftime("%Y-%m-%d")]
+        for interval in intervals:
+            selected = day[day["时段"] == interval]
+            if len(selected) != 1:
+                raise ValueError(f"{target}的{interval}记录不唯一。")
+            record.extend(
+                [
+                    interval,
+                    float(selected.iloc[0]["调整购电量_kWh"]),
+                ]
+            )
+        total_cost = float(
+            day[
+                ["计划购电费_元", "调整费用_元", "紧急购电费_元"]
+            ].to_numpy(dtype=float).sum()
+        )
+        record.extend(
+            [
+                float(day["调整购电量_kWh"].sum()),
+                total_cost,
+            ]
+        )
+        final_sheet.append(record)
+
+    comparison_sheet = workbook.create_sheet("计划调整对照")
+    comparison_sheet.append(
+        [
+            "日期",
+            "时间段",
+            "电价(元/kWh)",
+            "计划购电量(kWh)",
+            "最终购电量(kWh)",
+            "调整净变化(kWh)",
+        ]
+    )
+    for target in TARGET_DATES:
+        day = detail[detail["日期"].dt.date == target].sort_values("时段序号")
+        for interval in intervals:
+            selected = day[day["时段"] == interval].iloc[0]
+            plan_value = float(selected["计划购电量_kWh"])
+            adjusted_value = float(selected["调整购电量_kWh"])
+            comparison_sheet.append(
+                [
+                    target.strftime("%Y-%m-%d"),
+                    interval,
+                    float(selected["电价_元每kWh"]),
+                    plan_value,
+                    adjusted_value,
+                    adjusted_value - plan_value,
+                ]
+            )
+
+    for worksheet in workbook.worksheets:
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for column in range(1, worksheet.max_column + 1):
+            worksheet.column_dimensions[get_column_letter(column)].width = 22
+        worksheet.freeze_panes = "B2"
+    for cell in plan_sheet[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    for column in range(1, len(headers) + 1):
-        worksheet.column_dimensions[get_column_letter(column)].width = 22
-    worksheet.freeze_panes = "B2"
     workbook.save(output_path)
     workbook.close()
 
@@ -279,7 +365,7 @@ def write_paper_tables(
     table3 = output_dir / "表3_指定日期紧急购电量.xlsx"
     write_table1_excel(detail, table1)
     write_table2_excel(p2, detail, storage, table2)
-    table3_data = p2.build_table3(detail)
+    table3_data = merge_contiguous_emergency_events(detail)
     p2.write_table3_excel(table3_data, table3)
     return {
         "表1": table1,
@@ -294,6 +380,7 @@ def run_forecast_sensitivity(
     data: pd.DataFrame,
     forecasts: dict[date, dict[int, np.ndarray]],
     storage,
+    settlement_mode: str = "plan_full",
 ) -> pd.DataFrame:
     """对指定日期进行预报整体缩放灵敏度分析。"""
     rows: list[dict[str, object]] = []
@@ -308,6 +395,7 @@ def run_forecast_sensitivity(
                 forecast_by_hour=forecasts[target],
                 storage=storage,
                 forecast_scale=scale,
+                settlement_mode=settlement_mode,
             )
             rows.append(
                 {
@@ -470,6 +558,7 @@ def write_report(
     scenarios: pd.DataFrame,
     sensitivity: pd.DataFrame,
     storage,
+    settlement_mode: str,
 ) -> None:
     """写出问题3结果说明。"""
     period = daily[
@@ -527,6 +616,7 @@ def write_report(
         "- 调整购电量高于计划购电量部分按交易时刻电价150%计费。",
         "- 最终实际光伏与预报的偏差由紧急购电或弃光结算。",
         "- 储能每天0:00和24:00均为6000 kWh。",
+        f"- 费用结算口径：{settlement_mode}。",
         "",
         "## 储能参数",
         "",
@@ -588,6 +678,7 @@ def write_report(
 def main() -> None:
     """问题3主流程。"""
     configure_console()
+    args = parse_args()
     script_dir = Path(__file__).resolve().parent
     p2 = load_problem2_module()
     inputs = locate_inputs(script_dir)
@@ -611,7 +702,11 @@ def main() -> None:
     print_quantity_checks(data, forecasts, "附件1电价")
 
     # 所有代码和输出均位于“问题三”目录内；脚本可从任意当前目录启动。
-    output_dir = script_dir / "results"
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else script_dir / "results"
+    )
     tables_dir = output_dir / "tables"
     figures_dir = output_dir / "figures"
     logs_dir = output_dir / "logs"
@@ -619,14 +714,26 @@ def main() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     baseline = run_baseline_benchmark(p2, data, storage)
-    detail, daily, scenarios = solve_problem3(p2, data, forecasts, storage)
+    detail, daily, scenarios = solve_problem3(
+        p2,
+        data,
+        forecasts,
+        storage,
+        args.settlement_mode,
+    )
     specified = summarize_specified_dates(daily, include_adjustment=True)
     validation = validate_result_detail(detail, storage, include_adjustment=True)
     print("问题3约束校验：")
     for key, value in validation.items():
         print(f"{key} = {value:.10f}")
 
-    sensitivity = run_forecast_sensitivity(p2, data, forecasts, storage)
+    sensitivity = run_forecast_sensitivity(
+        p2,
+        data,
+        forecasts,
+        storage,
+        args.settlement_mode,
+    )
     scenario_summary = aggregate_forecast_scenarios(
         scenarios.to_dict(orient="records")
     )
@@ -707,6 +814,7 @@ def main() -> None:
         scenarios,
         sensitivity,
         storage,
+        args.settlement_mode,
     )
     summary = {
         "输出期": {
@@ -718,6 +826,7 @@ def main() -> None:
             "紧急购电量_kWh": float(daily["紧急购电量_kWh"].sum()),
             "总费用_元": float(daily["总费用_元"].sum()),
         },
+        "费用结算口径": args.settlement_mode,
         "约束校验": validation,
         "指定日期结果": specified.assign(
             日期=specified["日期"].dt.strftime("%Y-%m-%d")

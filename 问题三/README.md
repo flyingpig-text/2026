@@ -8,6 +8,23 @@
 python "D:\46884\Documents\2026\问题三\problem3_run.py"
 ```
 
+默认采用推导文档中的 `plan_full` 口径，即计划购电量始终按正常电价结算，
+再对调整偏差收取费用。若题目意图是“正常电价只结算计划量与调整量中的较小值”，
+可切换到 `actual_base`：
+
+```powershell
+python "D:\46884\Documents\2026\问题三\problem3_run.py" `
+  --settlement-mode actual_base `
+  --output-dir "D:\46884\Documents\2026\问题三\results_actual_base"
+```
+
+运行完成后可执行自动质量检查：
+
+```powershell
+python "D:\46884\Documents\2026\问题三\verify_result3.py" `
+  --result-dir "D:\46884\Documents\2026\问题三\results"
+```
+
 程序通过 `Path(__file__).resolve().parent` 自动定位脚本目录，并向上搜索以下原始附件：
 
 - `题目/附件/附件1.xlsx`：电价、小区负载和光伏发电预测功率；
@@ -154,8 +171,8 @@ e_{d,t}^{F}=\max\left(
 
 `问题三/results/` 中的主要结果包括：
 
-- `result3.xlsx`：官方四工作表结果；
-- `表1_指定日期购电量.xlsx`；
+- `result3.xlsx`：官方四工作表结果，紧急购电按连续时段合并；
+- `表1_指定日期购电量.xlsx`：包含计划购电量、最终购电量和计划调整对照三个工作表；
 - `表2_指定日期充放电量.xlsx`；
 - `表3_指定日期紧急购电量.xlsx`；
 - `指定日期结果.xlsx`；

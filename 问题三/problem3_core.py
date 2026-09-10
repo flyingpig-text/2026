@@ -40,6 +40,7 @@ OUTPUT_END = date(2025, 12, 31)
 EMERGENCY_MULTIPLIER = 5.0
 DOWN_ADJUSTMENT_MULTIPLIER = 0.5
 UP_ADJUSTMENT_MULTIPLIER = 1.5
+SETTLEMENT_MODES = ("plan_full", "actual_base")
 
 
 def load_problem2_module():
@@ -145,10 +146,14 @@ def read_attachment3(path: Path) -> dict[date, dict[int, np.ndarray]]:
         if release_text not in hour_map:
             raise ValueError(f"附件3存在未知预报时刻：{release_text}")
         release_hour = hour_map[release_text]
+        if release_hour in rows.setdefault(current_date, {}):
+            raise ValueError(
+                f"附件3在{current_date} {release_text}存在重复预报记录。"
+            )
         values = np.array(row[2:26], dtype=float)
         if not np.all(np.isfinite(values)) or np.any(values < 0.0):
             raise ValueError(f"附件3在{current_date} {release_text}存在非法预报值。")
-        rows.setdefault(current_date, {})[release_hour] = values
+        rows[current_date][release_hour] = values
 
     expected_dates = set(pd.date_range("2025-01-01", "2025-12-31", freq="D").date)
     if set(rows) != expected_dates:
@@ -245,18 +250,25 @@ def solve_adjustment_segment(
     plan_purchase_kwh: np.ndarray,
     storage,
     initial_soc_kwh: float,
+    settlement_mode: str = "plan_full",
     time_limit_s: float = 120.0,
 ) -> dict[str, np.ndarray]:
     """
     对尚未执行的时间段求最终调整购电量和充放电计划。
 
     变量顺序：
-        [调整购电q, 上调up, 下调down, 充电c, 放电d,
-         SOC E, 弃光s, 充放电状态z]
+        [调整购电q, 正常结算基础电量b, 上调up, 下调down,
+         充电c, 放电d, SOC E, 弃光s, 充放电状态z]
+
+    settlement_mode:
+        plan_full：计划购电量始终按正常电价结算；
+        actual_base：正常电价只结算min(计划购电量,调整购电量)。
     """
     n = len(load_energy_kwh)
     if n <= 0:
         raise ValueError("调整时段长度必须为正。")
+    if settlement_mode not in SETTLEMENT_MODES:
+        raise ValueError(f"未知费用结算模式：{settlement_mode}")
     if not (
         len(forecast_pv_energy_kwh) == n
         and len(price_yuan_per_kwh) == n
@@ -265,16 +277,19 @@ def solve_adjustment_segment(
         raise ValueError("调整购电模型输入序列长度不一致。")
 
     q_slice = slice(0, n)
-    up_slice = slice(n, 2 * n)
-    down_slice = slice(2 * n, 3 * n)
-    c_slice = slice(3 * n, 4 * n)
-    d_slice = slice(4 * n, 5 * n)
-    soc_slice = slice(5 * n, 6 * n)
-    s_slice = slice(6 * n, 7 * n)
-    z_slice = slice(7 * n, 8 * n)
-    variable_count = 8 * n
+    base_slice = slice(n, 2 * n)
+    up_slice = slice(2 * n, 3 * n)
+    down_slice = slice(3 * n, 4 * n)
+    c_slice = slice(4 * n, 5 * n)
+    d_slice = slice(5 * n, 6 * n)
+    soc_slice = slice(6 * n, 7 * n)
+    s_slice = slice(7 * n, 8 * n)
+    z_slice = slice(8 * n, 9 * n)
+    variable_count = 9 * n
 
     objective = np.zeros(variable_count, dtype=float)
+    if settlement_mode == "actual_base":
+        objective[base_slice] = price_yuan_per_kwh
     objective[up_slice] = UP_ADJUSTMENT_MULTIPLIER * price_yuan_per_kwh
     objective[down_slice] = DOWN_ADJUSTMENT_MULTIPLIER * price_yuan_per_kwh
     integrality = np.zeros(variable_count, dtype=int)
@@ -289,26 +304,32 @@ def solve_adjustment_segment(
     upper[soc_slice] = storage.soc_max_kwh
     upper[s_slice] = forecast_pv_energy_kwh
     upper[z_slice] = 1.0
+    if settlement_mode == "plan_full":
+        upper[base_slice] = 0.0
+    else:
+        upper[base_slice] = plan_purchase_kwh
 
-    final_soc_index = 5 * n + (n - 1)
+    final_soc_index = 6 * n + (n - 1)
     lower[final_soc_index] = storage.initial_kwh
     upper[final_soc_index] = storage.initial_kwh
 
     balance = lil_matrix((n, variable_count), dtype=float)
     deviation = lil_matrix((n, variable_count), dtype=float)
+    base_limit = lil_matrix((n, variable_count), dtype=float)
     soc_balance = lil_matrix((n, variable_count), dtype=float)
     mutual = lil_matrix((2 * n, variable_count), dtype=float)
     mutual_rhs = np.zeros(2 * n, dtype=float)
 
     for t in range(n):
         q_index = t
-        up_index = n + t
-        down_index = 2 * n + t
-        c_index = 3 * n + t
-        d_index = 4 * n + t
-        soc_index = 5 * n + t
-        s_index = 6 * n + t
-        z_index = 7 * n + t
+        base_index = n + t
+        up_index = 2 * n + t
+        down_index = 3 * n + t
+        c_index = 4 * n + t
+        d_index = 5 * n + t
+        soc_index = 6 * n + t
+        s_index = 7 * n + t
+        z_index = 8 * n + t
 
         balance[t, q_index] = 1.0
         balance[t, d_index] = 1.0
@@ -318,6 +339,9 @@ def solve_adjustment_segment(
         deviation[t, q_index] = 1.0
         deviation[t, up_index] = -1.0
         deviation[t, down_index] = 1.0
+
+        base_limit[t, base_index] = 1.0
+        base_limit[t, q_index] = -1.0
 
         soc_balance[t, soc_index] = 1.0
         soc_balance[t, c_index] = -storage.efficiency
@@ -338,6 +362,11 @@ def solve_adjustment_segment(
     constraints = [
         LinearConstraint(balance.tocsr(), balance_rhs, balance_rhs),
         LinearConstraint(deviation.tocsr(), deviation_rhs, deviation_rhs),
+        LinearConstraint(
+            base_limit.tocsr(),
+            np.full(n, -np.inf),
+            np.zeros(n),
+        ),
         LinearConstraint(soc_balance.tocsr(), soc_rhs, soc_rhs),
         LinearConstraint(
             mutual.tocsr(),
@@ -356,12 +385,13 @@ def solve_adjustment_segment(
         raise RuntimeError(f"调整购电MILP求解失败：{result.message}")
     solution = np.asarray(result.x, dtype=float)
     q = np.clip(solution[q_slice], 0.0, None)
+    base = np.clip(solution[base_slice], 0.0, None)
     up = np.clip(solution[up_slice], 0.0, None)
     down = np.clip(solution[down_slice], 0.0, None)
     charge = np.clip(solution[c_slice], 0.0, None)
     discharge = np.clip(solution[d_slice], 0.0, None)
     curtail = np.clip(solution[s_slice], 0.0, None)
-    for values in (q, up, down, charge, discharge, curtail):
+    for values in (q, base, up, down, charge, discharge, curtail):
         values[np.abs(values) < 1e-8] = 0.0
     soc = compute_soc(
         initial_soc_kwh,
@@ -371,6 +401,7 @@ def solve_adjustment_segment(
     )
     return {
         "adjusted_purchase_kwh": q,
+        "base_purchase_kwh": base,
         "up_kwh": up,
         "down_kwh": down,
         "charge_kwh": charge,
@@ -390,8 +421,11 @@ def settle_actual_dispatch(
     price_yuan_per_kwh: np.ndarray,
     storage,
     initial_soc_kwh: float,
+    settlement_mode: str = "plan_full",
 ) -> dict[str, object]:
     """用实际光伏结算最终购电、紧急购电、弃光与各项费用。"""
+    if settlement_mode not in SETTLEMENT_MODES:
+        raise ValueError(f"未知费用结算模式：{settlement_mode}")
     required = load_energy_kwh + charge_kwh
     available = adjusted_purchase_kwh + actual_pv_energy_kwh + discharge_kwh
     emergency = np.maximum(required - available, 0.0)
@@ -402,11 +436,17 @@ def settle_actual_dispatch(
         UP_ADJUSTMENT_MULTIPLIER * up
         + DOWN_ADJUSTMENT_MULTIPLIER * down
     )
-    plan_cost = price_yuan_per_kwh * plan_purchase_kwh
+    base_purchase = (
+        plan_purchase_kwh
+        if settlement_mode == "plan_full"
+        else np.minimum(plan_purchase_kwh, adjusted_purchase_kwh)
+    )
+    plan_cost = price_yuan_per_kwh * base_purchase
     emergency_cost = EMERGENCY_MULTIPLIER * price_yuan_per_kwh * emergency
     soc = compute_soc(initial_soc_kwh, charge_kwh, discharge_kwh, storage.efficiency)
     return {
         "adjusted_purchase_kwh": adjusted_purchase_kwh,
+        "base_purchase_kwh": base_purchase,
         "charge_kwh": charge_kwh,
         "discharge_kwh": discharge_kwh,
         "emergency_purchase_kwh": emergency,
@@ -431,6 +471,7 @@ def run_rolling_day(
     forecast_by_hour: dict[int, np.ndarray],
     storage,
     forecast_scale: float = 1.0,
+    settlement_mode: str = "plan_full",
 ) -> dict[str, object]:
     """
     运行单日0:00计划与6:00、12:00、18:00滚动调整，返回最终方案和情景对比。
@@ -464,6 +505,7 @@ def run_rolling_day(
             price_yuan_per_kwh,
             storage,
             storage.initial_kwh,
+            settlement_mode=settlement_mode,
         )
         snapshots.append(
             {
@@ -501,6 +543,7 @@ def run_rolling_day(
             plan_purchase[start_index:],
             storage,
             current_soc,
+            settlement_mode=settlement_mode,
         )
         adjusted[start_index:] = adjustment["adjusted_purchase_kwh"]
         charge[start_index:] = adjustment["charge_kwh"]
@@ -518,6 +561,7 @@ def run_rolling_day(
         price_yuan_per_kwh,
         storage,
         storage.initial_kwh,
+        settlement_mode=settlement_mode,
     )
     return {
         "plan_purchase_kwh": plan_purchase,
@@ -661,11 +705,9 @@ def write_wide_sheet(
 ) -> None:
     """把逐10分钟序列写为日期×144时段的宽表。"""
     worksheet.delete_rows(2, worksheet.max_row)
-    worksheet.cell(1, 1, "日期\\时间")
-    for index, label in enumerate(build_natural_intervals(), start=2):
-        worksheet.cell(1, index, label)
-    worksheet.cell(1, 146, value_title)
-    worksheet.cell(1, 147, cost_title)
+    # 保留官方模板的表头文字和时段标签，不再重写为自定义自然区间。
+    if worksheet.max_column < 147:
+        raise ValueError("结果模板宽表列数不足147列。")
 
     dates = sorted(detail["日期"].dt.date.unique())
     for row_index, current_date in enumerate(dates, start=2):
@@ -692,6 +734,61 @@ def build_natural_intervals() -> list[str]:
     return labels
 
 
+def merge_contiguous_emergency_events(detail: pd.DataFrame) -> pd.DataFrame:
+    """把同一日期内连续非零的10分钟紧急购电合并为连续时间段。"""
+    events: list[dict[str, object]] = []
+    for current_date, day in detail.groupby(detail["日期"].dt.date):
+        active = day[
+            day["紧急购电量_kWh"].to_numpy(dtype=float) > 1e-8
+        ].sort_values("时段序号")
+        if active.empty:
+            continue
+
+        current_rows: list[pd.Series] = []
+        previous_index: int | None = None
+        for _, row in active.iterrows():
+            period_index = int(row["时段序号"])
+            if previous_index is None or period_index == previous_index + 1:
+                current_rows.append(row)
+            else:
+                first_label = str(current_rows[0]["时段"])
+                last_label = str(current_rows[-1]["时段"])
+                start_text = first_label.split("-", maxsplit=1)[0]
+                end_text = last_label.split("-", maxsplit=1)[1]
+                events.append(
+                    {
+                        "日期": pd.Timestamp(current_date),
+                        "紧急购电时间段": f"{start_text}-{end_text}",
+                        "紧急购电量_kWh": float(
+                            sum(
+                                float(item["紧急购电量_kWh"])
+                                for item in current_rows
+                            )
+                        ),
+                    }
+                )
+                current_rows = [row]
+            previous_index = period_index
+
+        first_label = str(current_rows[0]["时段"])
+        last_label = str(current_rows[-1]["时段"])
+        start_text = first_label.split("-", maxsplit=1)[0]
+        end_text = last_label.split("-", maxsplit=1)[1]
+        events.append(
+            {
+                "日期": pd.Timestamp(current_date),
+                "紧急购电时间段": f"{start_text}-{end_text}",
+                "紧急购电量_kWh": float(
+                    sum(float(item["紧急购电量_kWh"]) for item in current_rows)
+                ),
+            }
+        )
+    return pd.DataFrame(
+        events,
+        columns=["日期", "紧急购电时间段", "紧急购电量_kWh"],
+    )
+
+
 def write_emergency_sheet(
     worksheet,
     detail: pd.DataFrame,
@@ -699,21 +796,20 @@ def write_emergency_sheet(
     period_header: str = "紧急购电时间段",
     value_header: str = "紧急购电量(kWh)",
 ) -> None:
-    """写入紧急购电事件。"""
+    """写入合并连续时段后的紧急购电事件。"""
     worksheet.delete_rows(2, worksheet.max_row)
     worksheet.cell(1, 1, date_header)
     worksheet.cell(1, 2, period_header)
     worksheet.cell(1, 3, value_header)
+    events = merge_contiguous_emergency_events(detail)
     row_index = 2
-    for row in detail.itertuples(index=False):
-        if float(row.紧急购电量_kWh) <= 1e-8:
-            continue
+    for row in events.itertuples(index=False):
         worksheet.cell(
             row_index,
             1,
             datetime.combine(row.日期.date(), time.min),
         )
-        worksheet.cell(row_index, 2, row.时段)
+        worksheet.cell(row_index, 2, row.紧急购电时间段)
         worksheet.cell(row_index, 3, float(row.紧急购电量_kWh))
         row_index += 1
 
