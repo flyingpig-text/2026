@@ -27,8 +27,6 @@ from problem3_core import (  # noqa: E402
     OUTPUT_START,
     T,
     TARGET_DATES,
-    build_plan_only_result,
-    dataframe_row_for_day,
     load_problem2_module,
     locate_inputs,
     prepare_actual_data,
@@ -40,14 +38,18 @@ from problem3_core import (  # noqa: E402
     write_official_result,
     write_specified_date_workbook,
 )
-from problem3_algorithm import run_rolling_day  # noqa: E402
 from problem3_run import (  # noqa: E402
     aggregate_forecast_scenarios,
     configure_console,
     plot_forecast_and_dispatch,
     plot_scenarios,
     plot_storage,
-    solve_problem3,
+)
+from problem4_core import (  # noqa: E402
+    build_causal_price_forecast,
+    solve_problem42_year,
+    solve_problem43_day,
+    solve_problem43_year,
 )
 
 
@@ -131,36 +133,6 @@ def build_fixed_price_data(
     return result
 
 
-def build_causal_realtime_price_forecast(
-    price_by_date: dict,
-) -> dict:
-    """
-    只用决策日之前已经实现的附件4价格，构造按时段历史均值预测。
-
-    对第d天第t个10分钟时段：
-        pi_hat(d,t) = mean(pi(1,t), ..., pi(d-1,t))
-
-    预测只使用严格早于第d天的价格，不使用当天未来时段，也不使用未来日期
-    的数据。1月1日没有历史样本，目标结果从2月1日开始，因此不影响输出。
-    """
-    sorted_dates = sorted(price_by_date)
-    cumulative = np.zeros(T, dtype=float)
-    forecast: dict = {}
-    count = 0
-    for current_date in sorted_dates:
-        actual = np.asarray(price_by_date[current_date], dtype=float)
-        if actual.shape != (T,):
-            raise ValueError(f"{current_date}实时电价维度不是144。")
-        if count == 0:
-            # 仅作为内部占位；输出期间从2025-02-01开始，实际不会引用该值。
-            forecast[current_date] = actual.copy()
-        else:
-            forecast[current_date] = cumulative / float(count)
-        cumulative += actual
-        count += 1
-    return forecast
-
-
 def run_volatile_price_sensitivity(
     p2,
     data: pd.DataFrame,
@@ -181,14 +153,14 @@ def run_volatile_price_sensitivity(
         load = day["小区负载电量_kWh"].to_numpy(dtype=float)
         actual_pv = day["光伏实际电量_kWh"].to_numpy(dtype=float)
         for scale in (0.90, 0.95, 1.00, 1.05, 1.10):
-            rolling = run_rolling_day(
-                load,
-                actual_pv,
-                base_price,
-                forecasts[target],
-                storage,
-                forecast_scale=scale,
+            rolling = solve_problem43_day(
+                load_energy_kwh=load,
+                actual_pv_energy_kwh=actual_pv,
+                actual_price_yuan_per_kwh=base_price,
                 decision_price_yuan_per_kwh=decision_price,
+                forecast_by_hour=forecasts[target],
+                storage=storage,
+                forecast_scale=scale,
             )
             result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             forecast_rows.append(
@@ -205,13 +177,13 @@ def run_volatile_price_sensitivity(
                     "总费用_元": float(result["total_cost_yuan"]),
                 }
             )
-            rolling = run_rolling_day(
-                load,
-                actual_pv,
-                base_price * scale,
-                forecasts[target],
-                storage,
+            rolling = solve_problem43_day(
+                load_energy_kwh=load,
+                actual_pv_energy_kwh=actual_pv,
+                actual_price_yuan_per_kwh=base_price * scale,
                 decision_price_yuan_per_kwh=decision_price * scale,
+                forecast_by_hour=forecasts[target],
+                storage=storage,
             )
             price_result = (
                 rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
@@ -656,7 +628,7 @@ def main() -> None:
     storage = p2.read_storage_parameters(inputs["pdf"])
     forecasts = read_attachment3(inputs["attachment3"])
     price_by_date = read_price_matrix(inputs["attachment4"])
-    causal_price_forecast = build_causal_realtime_price_forecast(price_by_date)
+    causal_price_forecast = build_causal_price_forecast(price_by_date)
     data = prepare_actual_data(p2, inputs["attachment2"], price_by_date)
     fixed_data = build_fixed_price_data(p2, data, inputs["attachment1"])
 
@@ -674,7 +646,7 @@ def main() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     # 问题4-2：波动电价、实际光伏、按问题2口径。
-    detail42, daily42 = build_plan_only_result(p2, data, storage)
+    detail42, daily42 = solve_problem42_year(data, storage)
     validation42 = validate_result_detail(
         detail42,
         storage,
@@ -683,8 +655,7 @@ def main() -> None:
     specified42 = summarize_specified_dates(daily42, include_adjustment=False)
 
     # 问题4-3：波动电价、附件3预报、按问题3滚动调整。
-    detail43, daily43, scenarios43 = solve_problem3(
-        p2,
+    detail43, daily43, scenarios43 = solve_problem43_year(
         data,
         forecasts,
         storage,
@@ -699,8 +670,7 @@ def main() -> None:
 
     # 在同一储能和费用口径下重算问题2、3固定电价基准，保证对比可复现。
     print("问题4步骤2：重算问题2、问题3固定电价基准。")
-    fixed_detail42, fixed_daily42 = build_plan_only_result(
-        p2,
+    fixed_detail42, fixed_daily42 = solve_problem42_year(
         fixed_data,
         storage,
     )
@@ -709,8 +679,7 @@ def main() -> None:
         storage,
         include_adjustment=False,
     )
-    fixed_detail43, fixed_daily43, _ = solve_problem3(
-        p2,
+    fixed_detail43, fixed_daily43, _ = solve_problem43_year(
         fixed_data,
         forecasts,
         storage,
