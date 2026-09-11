@@ -2,9 +2,9 @@
 """
 2026 C 题第二问模块化运行入口。
 
-默认运行两阶段随机规划：
-    第一阶段：日前计划购电、储能充电、储能放电、SOC、充放电状态；
-    第二阶段：每个历史预测误差情景下的紧急购电和弃光。
+默认运行自适应两阶段随机规划：
+    日前只锁定计划购电量；
+    实际负荷和光伏到达后，储能按真实缺口和未来价值动态充放电。
 
 也可用 `--model deterministic` 运行原有确定性模型作对照。
 """
@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 import problem2_core as core
+import problem2_adaptive as adaptive
 import problem2_stochastic as stochastic
 import problem2_complete_solution as legacy
 
@@ -179,7 +180,7 @@ def write_stochastic_report(
     storage: core.StorageParameters,
     checks: dict[str, float],
     stochastic_solution: stochastic.StochasticSolution,
-    stochastic_lp_bound_yuan: float,
+    stochastic_objective_yuan: float,
     settled_solution: core.DispatchSolution,
     validation: dict[str, float],
     sensitivity_summary: pd.DataFrame,
@@ -189,8 +190,21 @@ def write_stochastic_report(
     rolling_summary: dict[str, float] | None,
     vss_value: float | None,
     scenarios: int,
+    planning_scenarios: int,
     lookback_days: int,
     soc_policy: str,
+    warmup_days: int,
+    soc_grid_points: int,
+    error_lookback_days: int,
+    value_update_periods: int,
+    trim_fraction: float,
+    terminal_value_factor: float,
+    curtail_penalty_fraction: float,
+    cycle_penalty_yuan_per_kwh: float,
+    cvar_weight: float,
+    cvar_alpha: float,
+    purchase_risk_quantile: float,
+    purchase_risk_scale: float,
 ) -> None:
     """写出两阶段随机规划结果说明。"""
     lines = [
@@ -198,11 +212,26 @@ def write_stochastic_report(
         "",
         "## 1. 模型口径",
         "",
-        f"- 每天使用 {scenarios} 个历史误差情景。",
+        f"- 实际执行使用 {scenarios} 个历史误差情景。",
+        f"- 计划购电采用 {planning_scenarios} 个代表情景的场景追索模型，"
+        "并加入风险下限。",
         f"- 历史误差回看窗口为 {lookback_days} 天。",
-        f"- 第一阶段SOC策略为 `{soc_policy}`。",
-        "- 第一阶段日前计划购电、充放电和SOC对所有情景相同。",
-        "- 第二阶段紧急购电和弃光随负荷、光伏情景变化。",
+        f"- 1 月储能待机预热 {warmup_days} 天，2 月 1 日从 6000 kWh 开始。",
+        f"- 实际执行未来价值使用 {soc_grid_points} 点 SOC 网格。",
+        f"- 误差衰减系数使用此前 {error_lookback_days} 天估计。",
+        f"- 未来价值函数每 {value_update_periods} 个10分钟时段重算。",
+        f"- 未来价值情景采用 {trim_fraction:.0%} 截尾平均。",
+        f"- 续存价值倍率为 {terminal_value_factor:.6f}。",
+        f"- 未利用供能惩罚占电价比例为 {curtail_penalty_fraction:.2%}。",
+        f"- 充放电循环正则项为 {cycle_penalty_yuan_per_kwh:.6f} 元/kWh。",
+        f"- CVaR权重为 {cvar_weight:.4f}，置信水平为 {cvar_alpha:.2f}。",
+        f"- 计划购电风险分位点为 {purchase_risk_quantile:.2f}，"
+        f"风险下限加权为 {purchase_risk_scale:.2f}。",
+        "- 日前只锁定计划购电量；实际充放电和SOC根据真实负荷、光伏动态调整。",
+        "- 实际缺口先由储能响应，再结算紧急购电；富余供能优先用于充电。",
+        "- 正式主结果按逐日滚动方式生成，每天0:00锁定当天计划。",
+        "- 问题二只使用附件1的电价和附件2的实际负荷、光伏；"
+        "附件3属于问题三，不参与问题二预测。",
         "- 最终使用附件2的真实负荷和光伏计算实际应急电量。",
         "",
         "## 2. 储能参数",
@@ -219,11 +248,17 @@ def write_stochastic_report(
         "## 3. 随机规划结果",
         "",
         f"- 计划购电费：{stochastic_solution.planned_cost_yuan:.6f} 元。",
-        f"- 随机LP原目标下界：{stochastic_lp_bound_yuan:.6f} 元。",
         f"- 情景期望紧急购电费："
         f"{stochastic_solution.expected_emergency_cost_yuan:.6f} 元。",
         f"- 两阶段期望总费用："
         f"{stochastic_solution.expected_total_cost_yuan:.6f} 元。",
+        f"- 日末库存续存价值："
+        f"{stochastic_solution.terminal_soc_value_yuan_per_kwh:.6f} "
+        "元/kWh。",
+        f"- 续存价值抵扣："
+        f"{stochastic_solution.terminal_value_credit_yuan:.6f} 元。",
+        f"- 含续存价值的滚动模型目标值："
+        f"{stochastic_objective_yuan:.6f} 元。",
         f"- 真实数据结算总费用：{settled_solution.total_cost_yuan:.6f} 元。",
         f"- 真实数据紧急购电量："
         f"{settled_solution.emergency_kwh.sum():.6f} kWh。",
@@ -279,7 +314,7 @@ def write_stochastic_report(
         lines.extend(
             [
                 "",
-                "## 10. 逐日滚动样本外回测",
+                "## 10. 逐日滚动主结果",
                 "",
                 f"- 滚动期望总购电费："
                 f"{rolling_summary['滚动期望总购电费_元']:.6f} 元。",
@@ -350,264 +385,199 @@ def main() -> None:
     )
 
     if args.model == "stochastic":
-        legacy.log("步骤3：读取附件3光伏预报并生成历史误差情景")
-        reference_load_144, _ = read_attachment1_load_pv(paths["a1"])
-        pv_forecast_matrix = read_attachment3_pv_forecast(paths["a3"])
+        legacy.log("步骤3：构造新模型的负荷、光伏点预测和历史配对误差情景")
+        reference_load_144, reference_pv_144 = read_attachment1_load_pv(
+            paths["a1"]
+        )
         load_matrix = load_energy.reshape(
             core.DAYS,
             core.PERIODS_PER_DAY,
         )
-        load_point_matrix = np.vstack(
-            [reference_load_144.reshape(1, -1), load_matrix[:-1]]
+        pv_matrix = pv_energy.reshape(
+            core.DAYS,
+            core.PERIODS_PER_DAY,
+        )
+        (
+            load_forecast_matrix,
+            pv_forecast_matrix,
+            day_types,
+        ) = stochastic.build_point_forecasts(
+            load_matrix,
+            pv_matrix,
+            reference_load_144,
+            reference_pv_144,
+            lookback_days=args.lookback_days,
         )
         load_scenarios, pv_scenarios, probabilities = (
             stochastic.generate_historical_scenarios(
                 load_matrix,
-                pv_energy.reshape(core.DAYS, core.PERIODS_PER_DAY),
-                load_point_matrix,
-                pv_forecast_matrix,
+                pv_matrix,
+                reference_load_144,
+                reference_pv_144,
                 n_scenarios=args.scenarios,
                 lookback_days=args.lookback_days,
             )
         )
+        terminal_soc_value = stochastic.compute_terminal_soc_value(
+            price_144,
+            storage,
+        ) * args.terminal_value_factor
         legacy.log(
             f"情景维度={load_scenarios.shape}，"
             f"每天概率和={probabilities[0].sum():.10f}，"
-            f"光伏预报0:00首日合计={pv_forecast_matrix[0].sum():.6f} kWh。"
+            f"低负载日数={int(np.sum(day_types == 0))}。"
         )
-        legacy.log("步骤4：求解两阶段随机LP下界和无同时充放电可行解")
-        stochastic_lp_bound = stochastic.solve_stochastic_plan(
+        legacy.log(
+            "日末库存续存价值："
+            f"v={terminal_soc_value:.6f} 元/kWh，"
+            "v 由0:00--5:00平均电价除以放电效率计算。"
+        )
+        legacy.log("步骤4：逐日求解场景追索计划，并按真实数据动态执行储能")
+        adaptive_result = adaptive.solve_adaptive_rolling(
             load_scenarios,
             pv_scenarios,
             probabilities,
+            load_matrix,
+            pv_matrix,
+            load_forecast_matrix,
+            pv_forecast_matrix,
             price_144,
             storage,
-            relax_binary=True,
-            soc_final_policy=args.soc_final_policy,
-            time_limit_s=args.lp_time_limit,
-            tie_break_epsilon=0.0,
-        )
-        stochastic_lp = stochastic.solve_stochastic_plan(
-            load_scenarios,
-            pv_scenarios,
-            probabilities,
-            price_144,
-            storage,
-            relax_binary=True,
-            soc_final_policy=args.soc_final_policy,
+            terminal_soc_value_yuan_per_kwh=terminal_soc_value,
+            emergency_multiplier=5.0,
+            warmup_days=args.warmup_days,
+            soc_grid_points=args.soc_grid_points,
+            planning_mode="scenario_recourse",
+            planning_scenario_count=args.planning_scenarios,
+            error_lookback_days=args.error_lookback_days,
+            value_update_periods=args.value_update_periods,
+            trim_fraction=args.trim_fraction,
+            curtail_penalty_fraction=args.curtail_penalty_fraction,
+            cycle_penalty_yuan_per_kwh=args.cycle_penalty_yuan_per_kwh,
+            cvar_weight=args.cvar_weight,
+            cvar_alpha=args.cvar_alpha,
+            purchase_risk_quantile=args.purchase_risk_quantile,
+            purchase_risk_scale=args.purchase_risk_scale,
+            purchase_risk_lookback_days=args.purchase_risk_lookback_days,
+            purchase_risk_price_quantile=(
+                args.purchase_risk_price_quantile
+            ),
             time_limit_s=args.lp_time_limit,
             logger=legacy.log,
         )
-        legacy.log(
-            f"随机LP原目标下界="
-            f"{stochastic_lp_bound.expected_total_cost_yuan:.6f} 元；"
-            f"无同时充放电LP解="
-            f"{stochastic_lp.expected_total_cost_yuan:.6f} 元，"
-            f"最大同时充放电量="
-            f"{stochastic_lp.max_simultaneous_kwh:.6e} kWh。"
-        )
-        legacy.log("步骤5：验证两阶段MILP整数可行性和最优性")
-        candidate_gap = abs(
-            stochastic_lp.expected_total_cost_yuan
-            - stochastic_lp_bound.expected_total_cost_yuan
-        ) / (
-            abs(stochastic_lp_bound.expected_total_cost_yuan) + 1e-12
-        )
-        if (
-            stochastic_lp.integer_feasible
-            and candidate_gap <= 1e-7
-            and not args.force_full_milp
-        ):
-            stochastic_solution = replace(
-                stochastic_lp,
-                solver_status=(
-                    "随机LP解满足充放电互斥，取z=0/1后为随机MILP全局最优解"
-                ),
-            )
-            legacy.log("随机LP解满足整数互斥，无需随机MILP分支定界。")
-        else:
-            legacy.log(
-                "无同时充放电LP解与原始下界未严格一致，执行随机MILP验证。"
-            )
-            stochastic_solution = stochastic.solve_stochastic_plan(
-                load_scenarios,
-                pv_scenarios,
-                probabilities,
-                price_144,
-                storage,
-                relax_binary=False,
-                soc_final_policy=args.soc_final_policy,
-                time_limit_s=args.milp_time_limit,
-                logger=legacy.log,
-            )
-        stochastic_gap = abs(
-            stochastic_solution.expected_total_cost_yuan
-            - stochastic_lp_bound.expected_total_cost_yuan
-        ) / (
-            abs(stochastic_solution.expected_total_cost_yuan) + 1e-12
-        )
-        if (
-            stochastic_solution.expected_total_cost_yuan
-            + 1e-4
-            < stochastic_lp_bound.expected_total_cost_yuan
-        ):
-            raise ValueError("随机整数解费用低于LP下界，模型不一致。")
-        validation = stochastic.validate_stochastic_solution(
-            stochastic_solution,
-            load_scenarios,
-            pv_scenarios,
-            storage,
-        )
-        settled_solution = stochastic.realize_stochastic_plan(
-            stochastic_solution,
+        settled_solution = adaptive_result.actual_dispatch
+        validation = core.validate_dispatch(
+            settled_solution,
             load_energy,
             pv_energy,
-            price_all,
+            storage,
         )
-        legacy.log("步骤6：用真实负荷和光伏结算最终应急电量")
+        # 构造兼容对象，供既有结果说明和JSON导出复用。
+        expected_terminal_value = (
+            adaptive_result.expected_planned_cost_yuan
+            + adaptive_result.expected_emergency_cost_yuan
+            - adaptive_result.expected_plan_objective_yuan
+        )
+        stochastic_solution = stochastic.StochasticSolution(
+            planned_kwh=adaptive_result.planned_kwh,
+            charge_kwh=adaptive_result.charge_kwh,
+            discharge_kwh=adaptive_result.discharge_kwh,
+            soc_kwh=adaptive_result.soc_kwh,
+            scenario_emergency_kwh=np.zeros_like(load_scenarios),
+            scenario_curtail_kwh=np.zeros_like(pv_scenarios),
+            planned_cost_yuan=adaptive_result.expected_planned_cost_yuan,
+            expected_emergency_cost_yuan=(
+                adaptive_result.expected_emergency_cost_yuan
+            ),
+            expected_total_cost_yuan=(
+                adaptive_result.expected_planned_cost_yuan
+                + adaptive_result.expected_emergency_cost_yuan
+            ),
+            solver_status=settled_solution.solver_status,
+            solver_success=True,
+            relax_binary=False,
+            solve_seconds=adaptive_result.solve_seconds,
+            max_simultaneous_kwh=adaptive_result.max_simultaneous_kwh,
+            terminal_soc_value_yuan_per_kwh=terminal_soc_value,
+            terminal_value_credit_yuan=expected_terminal_value,
+            objective_value_yuan=adaptive_result.expected_plan_objective_yuan,
+        )
+        stochastic_lp = None
+        stochastic_lp_bound = None
+        stochastic_gap = float("nan")
+        legacy.log("步骤5：用实际负荷和光伏结算自适应执行计划")
         legacy.log(
             f"真实结算总购电费="
             f"{settled_solution.total_cost_yuan:.6f} 元，"
             f"真实紧急购电量="
-            f"{settled_solution.emergency_kwh.sum():.6f} kWh。"
+            f"{settled_solution.emergency_kwh.sum():.6f} kWh，"
+            f"年末SOC={stochastic_solution.soc_kwh[-1]:.6f} kWh。"
         )
-        rolling_summary = None
-        if args.rolling_backtest:
-            legacy.log("步骤6.1：执行逐日滚动样本外回测")
-            rolling_solution = stochastic.solve_rolling_stochastic_plan(
-                load_scenarios,
-                pv_scenarios,
-                probabilities,
-                price_144,
-                storage,
-                soc_final_policy=args.soc_final_policy,
-                logger=legacy.log,
-            )
-            rolling_settled = stochastic.realize_stochastic_plan(
-                rolling_solution,
-                load_energy,
-                pv_energy,
-                price_all,
-            )
-            rolling_records: list[dict[str, object]] = []
-            for day_index, current_date in enumerate(
-                pd.date_range(
-                    "2025-01-01",
-                    "2025-12-31",
-                    freq="D",
-                )
-            ):
-                start = day_index * core.PERIODS_PER_DAY
-                stop = start + core.PERIODS_PER_DAY
-                rolling_records.append(
-                    {
-                        "日期": current_date,
-                        "计划购电量_kWh": float(
-                            rolling_solution.planned_kwh[start:stop].sum()
-                        ),
-                        "期望紧急购电量_kWh": float(
-                            np.sum(
-                                probabilities[day_index]
-                                * rolling_solution
-                                .scenario_emergency_kwh[day_index]
-                                .sum(axis=1)
-                            )
-                        ),
-                        "实际紧急购电量_kWh": float(
-                            rolling_settled
-                            .emergency_kwh[start:stop]
-                            .sum()
-                        ),
-                        "实际结算总购电费_元": float(
-                            np.dot(
-                                price_144,
-                                rolling_settled.planned_kwh[start:stop],
-                            )
-                            + 5.0
-                            * np.dot(
-                                price_144,
-                                rolling_settled.emergency_kwh[start:stop],
-                            )
-                        ),
-                        "24:00储电量_kWh": float(
-                            rolling_solution.soc_kwh[stop]
-                        ),
-                    }
-                )
-            rolling_daily = pd.DataFrame(rolling_records)
-            rolling_daily.to_csv(
-                tables_dir / "滚动逐日回测.csv",
-                index=False,
-                encoding="utf-8-sig",
-            )
-            rolling_summary = {
-                "滚动期望总购电费_元": (
-                    rolling_solution.expected_total_cost_yuan
-                ),
-                "滚动实际结算总购电费_元": (
-                    rolling_settled.total_cost_yuan
-                ),
-                "滚动实际紧急购电量_kWh": float(
-                    rolling_settled.emergency_kwh.sum()
-                ),
-                "滚动年末储电量_kWh": float(
-                    rolling_solution.soc_kwh[-1]
-                ),
-            }
-            legacy.log(
-                "滚动回测完成："
-                f"期望费用={rolling_solution.expected_total_cost_yuan:.6f} 元，"
-                f"实际费用={rolling_settled.total_cost_yuan:.6f} 元。"
-            )
 
-        point_load = load_point_matrix.reshape(-1)
-        point_pv = pv_forecast_matrix.reshape(-1)
-        point_solution = core.solve_energy_dispatch(
-            point_load,
-            point_pv,
-            price_all,
-            storage,
-            relax_binary=True,
-            soc_final_policy=args.soc_final_policy,
-            time_limit_s=args.lp_time_limit,
+        rolling_records: list[dict[str, object]] = []
+        for day_index, current_date in enumerate(
+            pd.date_range("2025-01-01", "2025-12-31", freq="D")
+        ):
+            start = day_index * core.PERIODS_PER_DAY
+            stop = start + core.PERIODS_PER_DAY
+            rolling_records.append(
+                {
+                    "日期": current_date,
+                    "点预测负荷合计_kWh": float(
+                        load_forecast_matrix[day_index].sum()
+                    ),
+                    "点预测光伏合计_kWh": float(
+                        pv_forecast_matrix[day_index].sum()
+                    ),
+                    "日类型_0低负载_1普通": int(day_types[day_index]),
+                    "计划购电量_kWh": float(
+                        stochastic_solution.planned_kwh[start:stop].sum()
+                    ),
+                    "期望紧急购电量_kWh": float("nan"),
+                    "实际紧急购电量_kWh": float(
+                        settled_solution.emergency_kwh[start:stop].sum()
+                    ),
+                    "实际结算总购电费_元": float(
+                        np.dot(
+                            price_144,
+                            settled_solution.planned_kwh[start:stop],
+                        )
+                        + 5.0
+                        * np.dot(
+                            price_144,
+                            settled_solution.emergency_kwh[start:stop],
+                        )
+                    ),
+                    "24:00储电量_kWh": float(
+                        stochastic_solution.soc_kwh[stop]
+                    ),
+                }
+            )
+        rolling_daily = pd.DataFrame(rolling_records)
+        rolling_daily.to_csv(
+            tables_dir / "逐日滚动主结果.csv",
+            index=False,
+            encoding="utf-8-sig",
         )
-        if not point_solution.integer_feasible:
-            point_solution = core.solve_energy_dispatch(
-                point_load,
-                point_pv,
-                price_all,
-                storage,
-                relax_binary=False,
-                soc_final_policy=args.soc_final_policy,
-                time_limit_s=args.milp_time_limit,
-            )
-        eev = stochastic.evaluate_plan_under_scenarios(
-            point_solution.planned_kwh,
-            point_solution.charge_kwh,
-            point_solution.discharge_kwh,
-            load_scenarios,
-            pv_scenarios,
-            probabilities,
-            price_144,
-        )
-        if eev["情景可行性"] > 0.5:
-            vss_value = (
-                eev["期望总购电费_元"]
-                - stochastic_solution.expected_total_cost_yuan
-            )
-            legacy.log(
-                f"点预测确定性模型期望费用="
-                f"{eev['期望总购电费_元']:.6f} 元，"
-                f"VSS={vss_value:.6f} 元。"
-            )
-        else:
-            vss_value = None
-            legacy.log(
-                "点预测确定性方案在部分情景下需要弃光超过光伏上限，"
-                "因此不计算无约束的VSS数值。"
-            )
+        rolling_summary = {
+            "滚动期望总购电费_元": (
+                stochastic_solution.expected_total_cost_yuan
+            ),
+            "滚动实际结算总购电费_元": (
+                settled_solution.total_cost_yuan
+            ),
+            "滚动实际紧急购电量_kWh": float(
+                settled_solution.emergency_kwh.sum()
+            ),
+            "滚动年末储电量_kWh": float(
+                stochastic_solution.soc_kwh[-1]
+            ),
+        }
 
-        legacy.log("步骤7：进行两阶段随机模型灵敏度分析")
+        # 自适应模型使用实际因果执行，VSS不再用旧的固定C/D模型计算。
+        vss_value = None
+
+        legacy.log("步骤6：进行两阶段随机模型灵敏度分析")
         target_initial_soc = {
             (target - date(2025, 1, 1)).days: float(
                 stochastic_solution.soc_kwh[
@@ -617,20 +587,54 @@ def main() -> None:
             )
             for target in core.TARGET_DATES
         }
-        sensitivity = stochastic.run_stochastic_sensitivity(
-            load_matrix,
-            pv_energy.reshape(core.DAYS, core.PERIODS_PER_DAY),
-            load_point_matrix,
-            pv_forecast_matrix,
-            price_144,
-            storage,
-            target_dates=core.TARGET_DATES,
-            n_scenarios=args.scenarios,
-            lookback_days=args.lookback_days,
-            soc_final_policy=args.soc_final_policy,
-            initial_soc_by_day=target_initial_soc,
-            logger=legacy.log,
-        )
+        if args.skip_sensitivity:
+            sensitivity = pd.DataFrame(
+                columns=[
+                    "日期",
+                    "因素",
+                    "参数值",
+                    "期望总购电费_元",
+                    "实际结算总购电费_元",
+                    "计划购电量_kWh",
+                    "期望紧急购电量_kWh",
+                    "实际紧急购电量_kWh",
+                    "实际充电量_kWh",
+                    "实际放电量_kWh",
+                    "实际弃用量_kWh",
+                    "含续存价值目标值_元",
+                    "续存价值_元每kWh",
+                    "最大同时充放电量_kWh",
+                ]
+            )
+        else:
+            sensitivity = adaptive.run_adaptive_sensitivity(
+                load_matrix,
+                pv_matrix,
+                reference_load_144,
+                reference_pv_144,
+                price_144,
+                storage,
+                target_dates=core.TARGET_DATES,
+                n_scenarios=args.scenarios,
+                lookback_days=args.lookback_days,
+                initial_soc_by_day=target_initial_soc,
+                soc_grid_points=args.soc_grid_points,
+                planning_scenario_count=args.planning_scenarios,
+                error_lookback_days=args.error_lookback_days,
+                value_update_periods=args.value_update_periods,
+                trim_fraction=args.trim_fraction,
+                curtail_penalty_fraction=args.curtail_penalty_fraction,
+                cycle_penalty_yuan_per_kwh=args.cycle_penalty_yuan_per_kwh,
+                cvar_weight=args.cvar_weight,
+                cvar_alpha=args.cvar_alpha,
+                purchase_risk_quantile=args.purchase_risk_quantile,
+                purchase_risk_scale=args.purchase_risk_scale,
+                purchase_risk_lookback_days=args.purchase_risk_lookback_days,
+                purchase_risk_price_quantile=(
+                    args.purchase_risk_price_quantile
+                ),
+                logger=legacy.log,
+            )
         sensitivity_summary = (
             sensitivity.groupby(["因素", "参数值"], as_index=False)
             .agg(
@@ -646,11 +650,15 @@ def main() -> None:
             [
                 {
                     "终端SOC策略": args.soc_final_policy,
-                    "期望总购电费_元": (
+                    "续存价值_元每kWh": terminal_soc_value,
+                    "期望购电费_元": (
                         stochastic_solution.expected_total_cost_yuan
                     ),
                     "实际结算总购电费_元": (
                         settled_solution.total_cost_yuan
+                    ),
+                    "续存价值抵扣_元": (
+                        stochastic_solution.terminal_value_credit_yuan
                     ),
                     "年末储电量_kWh": float(
                         stochastic_solution.soc_kwh[-1]
@@ -790,6 +798,16 @@ def main() -> None:
         np.save(tables_dir / "情景光伏_kWh.npy", pv_scenarios)
         np.save(tables_dir / "情景概率.npy", probabilities)
         model_summary = {
+            "优化期计划购电费_元": (
+                adaptive_result.expected_planned_cost_yuan
+            ),
+            "全周期计划购电费_元": (
+                adaptive_result.total_planned_cost_yuan
+            ),
+            "全周期实际结算总购电费_元": (
+                settled_solution.total_cost_yuan
+            ),
+            "输出期实际结算总购电费_元": output_summary["总购电费_元"],
             "计划购电费_元": stochastic_solution.planned_cost_yuan,
             "期望紧急购电费_元": (
                 stochastic_solution.expected_emergency_cost_yuan
@@ -802,10 +820,14 @@ def main() -> None:
                 settled_solution.emergency_kwh.sum()
             ),
             "VSS_元": vss_value,
-            "随机LP原目标下界_元": (
-                stochastic_lp_bound.expected_total_cost_yuan
+            "日末库存续存价值_元每kWh": (
+                stochastic_solution.terminal_soc_value_yuan_per_kwh
             ),
-            "随机LP与整数解间隙": stochastic_gap,
+            "模型目标值含续存价值_元": (
+                stochastic_solution.objective_value_yuan
+            ),
+            "旧模型回退天数": len(adaptive_result.fallback_days),
+            "旧模型回退日期序号": adaptive_result.fallback_days,
         }
     else:
         model_summary = {
@@ -814,17 +836,88 @@ def main() -> None:
 
     summary = {
         "模型类型": args.model,
-        "输入文件": {key: str(value) for key, value in paths.items()},
+        "输入文件": {
+            key: str(value)
+            for key, value in paths.items()
+            if not (args.model == "stochastic" and key == "a3")
+        },
         "情景数量": (
             args.scenarios if args.model == "stochastic" else None
+        ),
+        "计划购电代表情景数": (
+            args.planning_scenarios
+            if args.model == "stochastic"
+            else None
         ),
         "历史回看天数": (
             args.lookback_days if args.model == "stochastic" else None
         ),
+        "储能待机预热天数": (
+            args.warmup_days if args.model == "stochastic" else None
+        ),
+        "未来价值SOC网格点数": (
+            args.soc_grid_points
+            if args.model == "stochastic"
+            else None
+        ),
+        "误差衰减估计回看天数": (
+            args.error_lookback_days
+            if args.model == "stochastic"
+            else None
+        ),
+        "未来价值重算周期_时段": (
+            args.value_update_periods
+            if args.model == "stochastic"
+            else None
+        ),
+        "未来价值截尾比例": (
+            args.trim_fraction if args.model == "stochastic" else None
+        ),
+        "续存价值倍率": (
+            args.terminal_value_factor
+            if args.model == "stochastic"
+            else None
+        ),
+        "U惩罚占电价比例": (
+            args.curtail_penalty_fraction
+            if args.model == "stochastic"
+            else None
+        ),
+        "循环正则_元每kWh": (
+            args.cycle_penalty_yuan_per_kwh
+            if args.model == "stochastic"
+            else None
+        ),
+        "CVaR权重": (
+            args.cvar_weight if args.model == "stochastic" else None
+        ),
+        "CVaR置信水平": (
+            args.cvar_alpha if args.model == "stochastic" else None
+        ),
+        "购电风险分位点": (
+            args.purchase_risk_quantile
+            if args.model == "stochastic"
+            else None
+        ),
+        "购电风险下限加权比例": (
+            args.purchase_risk_scale
+            if args.model == "stochastic"
+            else None
+        ),
+        "购电风险回看天数": (
+            args.purchase_risk_lookback_days
+            if args.model == "stochastic"
+            else None
+        ),
+        "购电风险启用电价分位点": (
+            args.purchase_risk_price_quantile
+            if args.model == "stochastic"
+            else None
+        ),
         "约束复核": validation,
         "输出期汇总": output_summary,
         "模型费用": model_summary,
-        "逐日滚动回测": rolling_summary,
+        "逐日滚动主结果": rolling_summary,
         "SOC终端策略对比": terminal_comparison.to_dict(
             orient="records"
         ),
@@ -863,7 +956,7 @@ def main() -> None:
             storage,
             checks,
             stochastic_solution,
-            stochastic_lp_bound.expected_total_cost_yuan,
+            stochastic_solution.objective_value_yuan,
             settled_solution,
             validation,
             sensitivity_summary,
@@ -873,8 +966,21 @@ def main() -> None:
             rolling_summary,
             vss_value,
             args.scenarios,
+            args.planning_scenarios,
             args.lookback_days,
             args.soc_final_policy,
+            args.warmup_days,
+            args.soc_grid_points,
+            args.error_lookback_days,
+            args.value_update_periods,
+            args.trim_fraction,
+            args.terminal_value_factor,
+            args.curtail_penalty_fraction,
+            args.cycle_penalty_yuan_per_kwh,
+            args.cvar_weight,
+            args.cvar_alpha,
+            args.purchase_risk_quantile,
+            args.purchase_risk_scale,
         )
     else:
         legacy.write_markdown_report(

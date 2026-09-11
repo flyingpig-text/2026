@@ -144,7 +144,7 @@ def parse_end_minutes(value: object) -> int:
     return minutes + (24 * 60 if next_day else 0)
 
 
-def find_project_paths(script_dir: Path) -> dict[str, Path]:
+def find_project_paths(script_dir: Path) -> dict[str, Path | None]:
     """从脚本所在目录向上自动查找题目附件和官方结果模板。"""
     roots = [script_dir, *script_dir.parents]
 
@@ -155,6 +155,15 @@ def find_project_paths(script_dir: Path) -> dict[str, Path]:
         raise FileNotFoundError(
             f"未找到{label}。请确认题目/附件目录与问题二脚本的相对位置。"
         )
+
+    def first_existing_optional(
+        candidates: Iterable[Path],
+    ) -> Path | None:
+        """查找可选附件；不存在时返回None，不阻断问题二。"""
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        return None
 
     candidates = {
         key: []
@@ -199,7 +208,7 @@ def find_project_paths(script_dir: Path) -> dict[str, Path]:
     return {
         "a1": first_existing(candidates["a1"], "附件1.xlsx"),
         "a2": first_existing(candidates["a2"], "附件2.xlsx"),
-        "a3": first_existing(candidates["a3"], "附件3.xlsx"),
+        "a3": first_existing_optional(candidates["a3"]),
         "pdf": first_existing(candidates["pdf"], "C题.pdf"),
         "template": first_existing(candidates["template"], "result2.xlsx"),
     }
@@ -1571,7 +1580,14 @@ def plot_sensitivity(sensitivity: pd.DataFrame, output_path: Path) -> None:
     for ax, factor in zip(axes.flat, factors):
         current = sensitivity[sensitivity["因素"] == factor].copy()
         if (
-            factor == "紧急电价倍数"
+            "扰动比例" not in current.columns
+            or factor in {
+                "紧急电价倍数",
+                "情景数量",
+                "历史回看天数",
+                "续存价值倍率",
+                "初始储电量",
+            }
             or current["扰动比例"].isna().all()
         ):
             current = current.sort_values("参数值")
@@ -1588,7 +1604,7 @@ def plot_sensitivity(sensitivity: pd.DataFrame, output_path: Path) -> None:
             color="#1f77b4",
         )
         ax.set_title(factor)
-        ax.set_ylabel("输出期购电费 (元)")
+        ax.set_ylabel("算例平均购电费 (元/日)")
         ax.grid(alpha=0.25)
     for ax in axes.flat[len(factors):]:
         ax.axis("off")
@@ -1787,7 +1803,7 @@ def write_markdown_report(
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="2026 C 题问题 2：全年储能 MILP、LP 校验和 result2.xlsx"
+        description="2026 C 题问题 2：逐日两阶段随机规划和 result2.xlsx"
     )
     parser.add_argument(
         "--output-dir",
@@ -1804,13 +1820,19 @@ def parse_args() -> argparse.Namespace:
         "--model",
         choices=("stochastic", "deterministic"),
         default="stochastic",
-        help="问题2模型类型；随机规划需要附件3的0:00光伏预报。",
+        help="问题2模型类型；随机模型按新推导文档逐日滚动。",
     )
     parser.add_argument(
         "--scenarios",
         type=int,
-        default=5,
+        default=30,
         help="两阶段随机规划每天使用的历史误差情景数。",
+    )
+    parser.add_argument(
+        "--planning-scenarios",
+        type=int,
+        default=5,
+        help="保守日前采购使用的代表情景数；实际执行仍使用全部情景。",
     )
     parser.add_argument(
         "--lookback-days",
@@ -1821,7 +1843,91 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rolling-backtest",
         action="store_true",
-        help="随机模型结束后执行逐日滚动样本外回测。",
+        help="兼容参数；随机主流程现在默认即为逐日滚动。",
+    )
+    parser.add_argument(
+        "--warmup-days",
+        type=int,
+        default=31,
+        help="储能待机预热天数；默认31天，使2月1日从6000 kWh开始。",
+    )
+    parser.add_argument(
+        "--soc-grid-points",
+        type=int,
+        default=61,
+        help="实际执行未来价值函数的SOC网格点数。",
+    )
+    parser.add_argument(
+        "--error-lookback-days",
+        type=int,
+        default=30,
+        help="估计误差衰减系数的历史回看天数。",
+    )
+    parser.add_argument(
+        "--value-update-periods",
+        type=int,
+        default=36,
+        help="未来价值函数重算周期，单位为10分钟时段数。",
+    )
+    parser.add_argument(
+        "--trim-fraction",
+        type=float,
+        default=0.10,
+        help="未来价值情景截尾比例，范围0--0.49。",
+    )
+    parser.add_argument(
+        "--terminal-value-factor",
+        type=float,
+        default=1.0,
+        help="续存价值倍率；用于校准库存保留强度。",
+    )
+    parser.add_argument(
+        "--curtail-penalty-fraction",
+        type=float,
+        default=0.0,
+        help="未利用供能惩罚占同时段电价的比例。",
+    )
+    parser.add_argument(
+        "--cycle-penalty-yuan-per-kwh",
+        type=float,
+        default=0.0,
+        help="充放电循环正则项，单位元/kWh。",
+    )
+    parser.add_argument(
+        "--cvar-weight",
+        type=float,
+        default=0.0,
+        help="紧急费用CVaR项的权重。",
+    )
+    parser.add_argument(
+        "--cvar-alpha",
+        type=float,
+        default=0.80,
+        help="CVaR置信水平，越接近1越关注极端尾部。",
+    )
+    parser.add_argument(
+        "--purchase-risk-quantile",
+        type=float,
+        default=0.0,
+        help="时段级计划购电历史误差分位点。",
+    )
+    parser.add_argument(
+        "--purchase-risk-lookback-days",
+        type=int,
+        default=30,
+        help="时段级计划购电风险下限的历史回看天数。",
+    )
+    parser.add_argument(
+        "--purchase-risk-price-quantile",
+        type=float,
+        default=0.75,
+        help="只对高于该分位点电价的时段启用购电风险下限。",
+    )
+    parser.add_argument(
+        "--purchase-risk-scale",
+        type=float,
+        default=0.20,
+        help="计划购电风险下限相对基础计划的加权比例。",
     )
     parser.add_argument(
         "--milp-time-limit",
@@ -1833,6 +1939,11 @@ def parse_args() -> argparse.Namespace:
         "--force-full-milp",
         action="store_true",
         help="即使 LP 最优解已满足充放电互斥，也强制执行全年 MILP 分支定界。",
+    )
+    parser.add_argument(
+        "--skip-sensitivity",
+        action="store_true",
+        help="跳过灵敏度分析，仅用于快速比较全年候选参数。",
     )
     parser.add_argument(
         "--lp-time-limit",
