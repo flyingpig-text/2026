@@ -156,7 +156,10 @@ def find_project_paths(script_dir: Path) -> dict[str, Path]:
             f"未找到{label}。请确认题目/附件目录与问题二脚本的相对位置。"
         )
 
-    candidates = {key: [] for key in ("a1", "a2", "pdf", "template")}
+    candidates = {
+        key: []
+        for key in ("a1", "a2", "a3", "pdf", "template")
+    }
     for root in roots:
         candidates["a1"].extend(
             [
@@ -170,6 +173,13 @@ def find_project_paths(script_dir: Path) -> dict[str, Path]:
                 root / "题目" / "附件" / "附件2.xlsx",
                 root / "附件" / "附件2.xlsx",
                 root / "附件2.xlsx",
+            ]
+        )
+        candidates["a3"].extend(
+            [
+                root / "题目" / "附件" / "附件3.xlsx",
+                root / "附件" / "附件3.xlsx",
+                root / "附件3.xlsx",
             ]
         )
         candidates["pdf"].extend(
@@ -189,6 +199,7 @@ def find_project_paths(script_dir: Path) -> dict[str, Path]:
     return {
         "a1": first_existing(candidates["a1"], "附件1.xlsx"),
         "a2": first_existing(candidates["a2"], "附件2.xlsx"),
+        "a3": first_existing(candidates["a3"], "附件3.xlsx"),
         "pdf": first_existing(candidates["pdf"], "C题.pdf"),
         "template": first_existing(candidates["template"], "result2.xlsx"),
     }
@@ -1549,21 +1560,23 @@ def plot_storage(
 
 def plot_sensitivity(sensitivity: pd.DataFrame, output_path: Path) -> None:
     """绘制全年重新优化后的单因素费用灵敏度。"""
-    factors = (
-        "负荷扰动",
-        "光伏扰动",
-        "电价水平",
-        "峰谷价差",
-        "充放电效率",
-        "紧急电价倍数",
+    factors = tuple(dict.fromkeys(sensitivity["因素"].tolist()))
+    row_count = max(1, (len(factors) + 2) // 3)
+    fig, axes = plt.subplots(
+        row_count,
+        3,
+        figsize=(18, max(4.5, 4.5 * row_count)),
+        squeeze=False,
     )
-    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     for ax, factor in zip(axes.flat, factors):
         current = sensitivity[sensitivity["因素"] == factor].copy()
-        if factor == "紧急电价倍数":
+        if (
+            factor == "紧急电价倍数"
+            or current["扰动比例"].isna().all()
+        ):
             current = current.sort_values("参数值")
             x_values = current["参数值"]
-            ax.set_xlabel("紧急购电价倍数")
+            ax.set_xlabel("参数值")
         else:
             current = current.sort_values("扰动比例")
             x_values = current["扰动比例"] * 100.0
@@ -1577,6 +1590,8 @@ def plot_sensitivity(sensitivity: pd.DataFrame, output_path: Path) -> None:
         ax.set_title(factor)
         ax.set_ylabel("输出期购电费 (元)")
         ax.grid(alpha=0.25)
+    for ax in axes.flat[len(factors):]:
+        ax.axis("off")
     fig.suptitle("问题 2 全年重新优化单因素灵敏度分析", fontsize=15)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(output_path, dpi=180)
@@ -1784,6 +1799,24 @@ def parse_args() -> argparse.Namespace:
         choices=("free", "initial", "daily-cycle"),
         default="free",
         help="年末/每日 SOC 策略；默认按推导文档采用跨日自由末端。",
+    )
+    parser.add_argument(
+        "--model",
+        choices=("stochastic", "deterministic"),
+        default="stochastic",
+        help="问题2模型类型；随机规划需要附件3的0:00光伏预报。",
+    )
+    parser.add_argument(
+        "--scenarios",
+        type=int,
+        default=5,
+        help="两阶段随机规划每天使用的历史误差情景数。",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=30,
+        help="情景误差抽样的历史回看天数。",
     )
     parser.add_argument(
         "--milp-time-limit",

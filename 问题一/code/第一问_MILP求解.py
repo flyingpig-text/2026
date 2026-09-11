@@ -1043,13 +1043,8 @@ def write_result_workbook(
             f"充放电量模板行标签不符合题目要求：{template_block_labels}"
         )
 
-    # 官方模板时间标签存在整体错位，按附件1自然区间重写。
-    plan_ws["B1"] = "购电量(kWh)"
-    for row_index, (natural_label, value) in enumerate(
-        zip(attachment["natural_intervals"], dispatch.grid_kwh),
-        start=2,
-    ):
-        plan_ws.cell(row=row_index, column=1, value=natural_label)
+    # 严格保留官方模板的表头、时间标签和格式，只写入B列购电量。
+    for row_index, value in enumerate(dispatch.grid_kwh, start=2):
         plan_ws.cell(row=row_index, column=2, value=float(value))
 
     charge_blocks = aggregate_four_hour_blocks(dispatch.charge_kwh)
@@ -1088,7 +1083,7 @@ def write_result_workbook(
                 original_plan_labels[index - 1],
                 attachment["time_labels"][index - 1],
                 natural_label,
-                "result1已按自然时段重写行标签",
+                "官方模板标签保持不变；模型内部按自然时段计算",
             ]
         )
     style_header(mapping_ws, 1, 1, 5)
