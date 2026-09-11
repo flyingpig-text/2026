@@ -423,6 +423,23 @@ def run_forecast_sensitivity(
     return result
 
 
+def save_figure(fig, output_path: Path) -> None:
+    """
+    规范化输出路径并保存图片。
+
+    Windows下若命令行传入重复反斜杠，Pillow可能抛出Errno 22。
+    这里先用系统规范路径写入；若仍失败，再用正斜杠路径重试。
+    """
+    normalized = Path(os.path.normpath(os.fspath(output_path)))
+    normalized.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fig.savefig(normalized, dpi=180)
+    except OSError as first_error:
+        if getattr(first_error, "errno", None) != 22:
+            raise
+        fig.savefig(normalized.as_posix(), dpi=180)
+
+
 def plot_forecast_and_dispatch(detail: pd.DataFrame, output_path: Path) -> None:
     """绘制指定日期的实际光伏、预报和计划调整结果。"""
     hours = np.arange(1, T + 1) * DT_H
@@ -475,7 +492,7 @@ def plot_forecast_and_dispatch(detail: pd.DataFrame, output_path: Path) -> None:
         ax.legend(loc="upper left", fontsize=7.5)
     fig.suptitle("问题3指定日期：预报更新、计划购电与调整购电", fontsize=15)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    fig.savefig(output_path, dpi=180)
+    save_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -524,7 +541,7 @@ def plot_storage(detail: pd.DataFrame, storage, output_path: Path) -> None:
         ax.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
     fig.suptitle("问题3指定日期：储能充放电与储电量", fontsize=15)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    fig.savefig(output_path, dpi=180)
+    save_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -533,9 +550,11 @@ def plot_scenarios(scenarios: pd.DataFrame, output_path: Path) -> None:
     aggregate = aggregate_forecast_scenarios(scenarios.to_dict(orient="records"))
     fig, ax1 = plt.subplots(figsize=(10, 5.5))
     x = np.arange(len(aggregate))
-    ax1.bar(x - 0.18, aggregate["总费用_元"], width=0.36, label="总费用", color="#1f77b4")
-    ax1.set_ylabel("总费用 (元)", color="#1f77b4")
-    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+    axis_text_color = "#222222"
+    ax1.bar(x - 0.18, aggregate["总费用_元"], width=0.36, label="总费用", color="#f5a684")
+    ax1.set_ylabel("总费用 (元)", color=axis_text_color)
+    ax1.tick_params(axis="y", labelcolor=axis_text_color)
+    ax1.tick_params(axis="x", labelcolor=axis_text_color)
     ax1.set_xticks(x)
     ax1.set_xticklabels(aggregate["情景"])
     ax1.grid(axis="y", alpha=0.25)
@@ -545,16 +564,16 @@ def plot_scenarios(scenarios: pd.DataFrame, output_path: Path) -> None:
         aggregate["紧急购电量_kWh"],
         width=0.36,
         label="紧急购电量",
-        color="#d62728",
+        color="#fcabed",
     )
-    ax2.set_ylabel("紧急购电量 (kWh)", color="#d62728")
-    ax2.tick_params(axis="y", labelcolor="#d62728")
+    ax2.set_ylabel("紧急购电量 (kWh)", color=axis_text_color)
+    ax2.tick_params(axis="y", labelcolor=axis_text_color)
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
     ax1.set_title("问题3：预报更新时点的边际价值")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
+    save_figure(fig, output_path)
     plt.close(fig)
 
 

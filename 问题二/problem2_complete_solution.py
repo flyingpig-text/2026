@@ -32,6 +32,7 @@ import re
 import sys
 import tempfile
 import time as wall_time
+from copy import copy
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -1106,105 +1107,153 @@ def write_result2(
     table3: pd.DataFrame,
     storage: StorageParams,
 ) -> None:
-    """复制官方模板并写入计划购电量、充放电量和紧急购电量。"""
+    """
+    严格按官方 result2.xlsx 模板写入。
+
+    保留官方工作表名称、表头、列顺序和日期/时刻格式；不添加额外工作表；
+    紧急购电只写实际发生的连续时间段，不逐 10 分钟展开。
+    """
     workbook = load_workbook(template_path)
     expected_sheets = ["计划购电量", "充放电量", "紧急购电量"]
     if workbook.sheetnames != expected_sheets:
         actual = workbook.sheetnames
         workbook.close()
-        raise ValueError(f"result2.xlsx 模板工作表应为 {expected_sheets}，实际为 {actual}。")
+        raise ValueError(
+            f"result2.xlsx 模板工作表应为 {expected_sheets}，实际为 {actual}。"
+        )
 
-    plan_ws = workbook["计划购电量"]
-    plan_ws.delete_rows(2, plan_ws.max_row)
-    # 保留官方模板的时间列名，避免改变附件 5 的既定格式。
-    # 附件中的 0:10、0:20、..., 0:00+1 是各 10 分钟时段的末端时刻，
-    # 写入顺序仍按附件 1/2 的 144 个时间点排列。
     output_detail = detail[
         (detail["日期"].dt.date >= OUTPUT_START)
         & (detail["日期"].dt.date <= OUTPUT_END)
     ]
+
+    # 工作表1：计划购电量。官方列头保持不变，数值按附件时间点顺序写入。
+    plan_ws = workbook["计划购电量"]
+    plan_row_styles = [
+        copy(plan_ws.cell(2, column)._style)
+        for column in range(1, plan_ws.max_column + 1)
+    ]
+    plan_ws.delete_rows(2, plan_ws.max_row)
     for row_index, current_date in enumerate(
         pd.date_range(OUTPUT_START, OUTPUT_END, freq="D"),
         start=2,
     ):
-        day = output_detail[output_detail["日期"].dt.date == current_date.date()].sort_values(
-            "时段序号"
-        )
+        day = output_detail[
+            output_detail["日期"].dt.date == current_date.date()
+        ].sort_values("时段序号")
         if len(day) != T:
             raise ValueError(f"{current_date.date()} 的 144 时段数据不完整。")
-        plan_ws.cell(row_index, 1, datetime.combine(current_date.date(), time.min))
-        for period_index, value in enumerate(day["计划购电量_kWh"], start=2):
+        date_cell = plan_ws.cell(
+            row_index,
+            1,
+            datetime.combine(current_date.date(), time.min),
+        )
+        date_cell.number_format = "mm-dd-yy"
+        for period_index, value in enumerate(
+            day["计划购电量_kWh"],
+            start=2,
+        ):
             plan_ws.cell(row_index, period_index, float(value))
         plan_ws.cell(row_index, 146, float(day["计划购电量_kWh"].sum()))
         plan_ws.cell(row_index, 147, float(day["计划购电费_元"].sum()))
+        for column in range(1, plan_ws.max_column + 1):
+            plan_ws.cell(row_index, column)._style = copy(
+                plan_row_styles[column - 1]
+            )
 
+    # 工作表2：充放电量。每天固定6个4小时时间段。
     charge_ws = workbook["充放电量"]
+    charge_row_styles = [
+        [
+            copy(charge_ws.cell(row, column)._style)
+            for column in range(1, 7)
+        ]
+        for row in range(2, 8)
+    ]
     charge_ws.delete_rows(2, charge_ws.max_row)
     for column, header in enumerate(
-        ["日期", "时间段", "充电量(kWh)", "放电量(kWh)", "时刻", "储电量(kWh)"],
+        ["日期", "时间段", "充电量", "放电量", "时刻", "储电量"],
         start=1,
     ):
         charge_ws.cell(1, column, header)
-    row_index = 2
+    charge_row = 2
     for current_date in pd.date_range(OUTPUT_START, OUTPUT_END, freq="D"):
-        day = output_detail[output_detail["日期"].dt.date == current_date.date()].sort_values(
-            "时段序号"
-        )
+        day = output_detail[
+            output_detail["日期"].dt.date == current_date.date()
+        ].sort_values("时段序号")
         charge = day["充电量_kWh"].to_numpy(float)
         discharge = day["放电量_kWh"].to_numpy(float)
-        day_start_row = row_index
+        day_start_row = charge_row
         for block_index, label in enumerate(FOUR_HOUR_BLOCKS):
             block = slice(block_index * 24, (block_index + 1) * 24)
-            charge_ws.cell(
-                row_index,
+            date_cell = charge_ws.cell(
+                charge_row,
                 1,
                 datetime.combine(current_date.date(), time.min)
                 if block_index == 0
                 else None,
             )
-            charge_ws.cell(row_index, 2, label)
-            charge_ws.cell(row_index, 3, float(charge[block].sum()))
-            charge_ws.cell(row_index, 4, float(discharge[block].sum()))
-            row_index += 1
+            if block_index == 0:
+                date_cell.number_format = "mm-dd-yy"
+            charge_ws.cell(charge_row, 2, label)
+            charge_ws.cell(charge_row, 3, float(charge[block].sum()))
+            charge_ws.cell(charge_row, 4, float(discharge[block].sum()))
+            charge_row += 1
         start_soc = float(day["时段末储电量_kWh"].iloc[0]) - (
             storage.efficiency * float(charge[0])
             - float(discharge[0]) / storage.efficiency
         )
-        charge_ws.cell(day_start_row, 5, "0:00")
+        start_time_cell = charge_ws.cell(day_start_row, 5, time(0, 0))
+        start_time_cell.number_format = "h:mm"
         charge_ws.cell(day_start_row, 6, start_soc)
-        charge_ws.cell(day_start_row + 1, 5, "24:00")
+        end_time_cell = charge_ws.cell(day_start_row + 1, 5, "24:00")
+        end_time_cell.number_format = "@"
         charge_ws.cell(
             day_start_row + 1,
             6,
             float(day["时段末储电量_kWh"].iloc[-1]),
         )
+        for block_index in range(6):
+            for column in range(1, 7):
+                charge_ws.cell(
+                    day_start_row + block_index,
+                    column,
+                )._style = copy(charge_row_styles[block_index][column - 1])
 
+    # 工作表3：紧急购电量。仅写发生事件的连续时间段。
     emergency_ws = workbook["紧急购电量"]
+    emergency_row_styles = [
+        copy(emergency_ws.cell(2, column)._style)
+        for column in range(1, 4)
+    ]
     emergency_ws.delete_rows(2, emergency_ws.max_row)
     emergency_ws.cell(1, 1, "日期")
-    emergency_ws.cell(1, 2, "紧急购电时间段")
-    emergency_ws.cell(1, 3, "紧急购电量(kWh)")
+    emergency_ws.cell(1, 2, "购电时间段")
+    emergency_ws.cell(1, 3, "购电量")
     event_row = 2
     for current_date in pd.date_range(OUTPUT_START, OUTPUT_END, freq="D"):
-        day = output_detail[output_detail["日期"].dt.date == current_date.date()].sort_values(
-            "时段序号"
-        )
-        for segment in emergency_segments(day):
-            emergency_ws.cell(
+        day = output_detail[
+            output_detail["日期"].dt.date == current_date.date()
+        ].sort_values("时段序号")
+        segments = emergency_segments(day)
+        for segment_index, segment in enumerate(segments):
+            date_cell = emergency_ws.cell(
                 event_row,
                 1,
-                datetime.combine(current_date.date(), time.min),
+                datetime.combine(current_date.date(), time.min)
+                if segment_index == 0
+                else None,
             )
+            if segment_index == 0:
+                date_cell.number_format = "mm-dd-yy"
             emergency_ws.cell(event_row, 2, segment["紧急购电时间段"])
             emergency_ws.cell(event_row, 3, segment["紧急购电量_kWh"])
+            for column in range(1, 4):
+                emergency_ws.cell(event_row, column)._style = copy(
+                    emergency_row_styles[column - 1]
+                )
             event_row += 1
 
-    for worksheet in workbook.worksheets:
-        worksheet.freeze_panes = "B2"
-        worksheet.row_dimensions[1].height = 25
-        for cell in worksheet[1]:
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
     workbook.save(output_path)
     workbook.close()
 
