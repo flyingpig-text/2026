@@ -77,6 +77,8 @@ def read_attachment1_load_pv(path: Path) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError("附件1时间列不是连续的10分钟序列。")
     load_kw = pd.to_numeric(frame["负荷"], errors="raise").to_numpy(float)[order]
     pv_kw = pd.to_numeric(frame["光伏"], errors="raise").to_numpy(float)[order]
+    if not np.all(np.isfinite(load_kw)) or not np.all(np.isfinite(pv_kw)):
+        raise ValueError("附件1负荷或光伏存在空值或非有限值。")
     if np.any(load_kw < 0.0) or np.any(pv_kw < 0.0):
         raise ValueError("附件1负荷和光伏不能为负。")
     return load_kw * core.DT_H, pv_kw * core.DT_H
@@ -103,9 +105,21 @@ def read_attachment3_pv_forecast(path: Path) -> np.ndarray:
     )
     if date_column is None or issue_column is None:
         raise ValueError("附件3必须包含日期和预报时刻列。")
-    forecast_columns = list(raw.columns[2:26])
-    if len(forecast_columns) != 24:
-        raise ValueError("附件3应包含预报1小时至预报24小时共24列。")
+    forecast_columns: list[object] = []
+    for hour in range(1, 25):
+        matched = next(
+            (
+                column
+                for name, column in normalized.items()
+                if f"预报{hour}小时" == name
+            ),
+            None,
+        )
+        if matched is None:
+            raise ValueError(
+                f"附件3缺少“预报{hour}小时”列。"
+            )
+        forecast_columns.append(matched)
     dates = pd.to_datetime(raw[date_column], errors="coerce").ffill()
     raw = raw.assign(日期=dates)
     expected_dates = pd.date_range("2025-01-01", "2025-12-31", freq="D")
@@ -122,6 +136,13 @@ def read_attachment3_pv_forecast(path: Path) -> np.ndarray:
             "",
             regex=False,
         )
+        expected_issue_text = {"0:00", "6:00", "12:00", "18:00"}
+        observed_issue_text = set(issue_text.tolist())
+        if observed_issue_text != expected_issue_text:
+            raise ValueError(
+                f"{current_date.date()}的预报时刻不是"
+                "0:00、6:00、12:00、18:00。"
+            )
         zero_rows = day_rows[
             issue_text.str.startswith("0:00")
             | issue_text.str.startswith("00:00")
@@ -132,6 +153,8 @@ def read_attachment3_pv_forecast(path: Path) -> np.ndarray:
             zero_rows.iloc[0][forecast_columns],
             errors="raise",
         ).to_numpy(float)
+        if not np.all(np.isfinite(hourly_forecast)):
+            raise ValueError("附件3光伏预报存在空值或非有限值。")
         if np.any(hourly_forecast < 0.0):
             raise ValueError("附件3光伏预报不能为负。")
         output[day_index] = np.repeat(hourly_forecast, 6) * core.DT_H
@@ -163,6 +186,7 @@ def write_stochastic_report(
     specified: pd.DataFrame,
     table3: pd.DataFrame,
     output_summary: dict[str, float],
+    rolling_summary: dict[str, float] | None,
     vss_value: float | None,
     scenarios: int,
     lookback_days: int,
@@ -251,6 +275,22 @@ def write_stochastic_report(
     )
     for key, value in checks.items():
         lines.append(f"- {key} = {value:.10f}")
+    if rolling_summary is not None:
+        lines.extend(
+            [
+                "",
+                "## 10. 逐日滚动样本外回测",
+                "",
+                f"- 滚动期望总购电费："
+                f"{rolling_summary['滚动期望总购电费_元']:.6f} 元。",
+                f"- 滚动实际结算总购电费："
+                f"{rolling_summary['滚动实际结算总购电费_元']:.6f} 元。",
+                f"- 滚动实际紧急购电量："
+                f"{rolling_summary['滚动实际紧急购电量_kWh']:.6f} kWh。",
+                f"- 滚动年末储电量："
+                f"{rolling_summary['滚动年末储电量_kWh']:.6f} kWh。",
+            ]
+        )
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -263,7 +303,7 @@ def main() -> None:
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
-        else script_dir / "output_modular"
+        else script_dir / "output"
     )
     tables_dir = output_dir / "tables"
     figures_dir = output_dir / "figures"
@@ -367,7 +407,17 @@ def main() -> None:
             f"{stochastic_lp.max_simultaneous_kwh:.6e} kWh。"
         )
         legacy.log("步骤5：验证两阶段MILP整数可行性和最优性")
-        if stochastic_lp.integer_feasible and not args.force_full_milp:
+        candidate_gap = abs(
+            stochastic_lp.expected_total_cost_yuan
+            - stochastic_lp_bound.expected_total_cost_yuan
+        ) / (
+            abs(stochastic_lp_bound.expected_total_cost_yuan) + 1e-12
+        )
+        if (
+            stochastic_lp.integer_feasible
+            and candidate_gap <= 1e-7
+            and not args.force_full_milp
+        ):
             stochastic_solution = replace(
                 stochastic_lp,
                 solver_status=(
@@ -376,6 +426,9 @@ def main() -> None:
             )
             legacy.log("随机LP解满足整数互斥，无需随机MILP分支定界。")
         else:
+            legacy.log(
+                "无同时充放电LP解与原始下界未严格一致，执行随机MILP验证。"
+            )
             stochastic_solution = stochastic.solve_stochastic_plan(
                 load_scenarios,
                 pv_scenarios,
@@ -418,6 +471,94 @@ def main() -> None:
             f"真实紧急购电量="
             f"{settled_solution.emergency_kwh.sum():.6f} kWh。"
         )
+        rolling_summary = None
+        if args.rolling_backtest:
+            legacy.log("步骤6.1：执行逐日滚动样本外回测")
+            rolling_solution = stochastic.solve_rolling_stochastic_plan(
+                load_scenarios,
+                pv_scenarios,
+                probabilities,
+                price_144,
+                storage,
+                soc_final_policy=args.soc_final_policy,
+                logger=legacy.log,
+            )
+            rolling_settled = stochastic.realize_stochastic_plan(
+                rolling_solution,
+                load_energy,
+                pv_energy,
+                price_all,
+            )
+            rolling_records: list[dict[str, object]] = []
+            for day_index, current_date in enumerate(
+                pd.date_range(
+                    "2025-01-01",
+                    "2025-12-31",
+                    freq="D",
+                )
+            ):
+                start = day_index * core.PERIODS_PER_DAY
+                stop = start + core.PERIODS_PER_DAY
+                rolling_records.append(
+                    {
+                        "日期": current_date,
+                        "计划购电量_kWh": float(
+                            rolling_solution.planned_kwh[start:stop].sum()
+                        ),
+                        "期望紧急购电量_kWh": float(
+                            np.sum(
+                                probabilities[day_index]
+                                * rolling_solution
+                                .scenario_emergency_kwh[day_index]
+                                .sum(axis=1)
+                            )
+                        ),
+                        "实际紧急购电量_kWh": float(
+                            rolling_settled
+                            .emergency_kwh[start:stop]
+                            .sum()
+                        ),
+                        "实际结算总购电费_元": float(
+                            np.dot(
+                                price_144,
+                                rolling_settled.planned_kwh[start:stop],
+                            )
+                            + 5.0
+                            * np.dot(
+                                price_144,
+                                rolling_settled.emergency_kwh[start:stop],
+                            )
+                        ),
+                        "24:00储电量_kWh": float(
+                            rolling_solution.soc_kwh[stop]
+                        ),
+                    }
+                )
+            rolling_daily = pd.DataFrame(rolling_records)
+            rolling_daily.to_csv(
+                tables_dir / "滚动逐日回测.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+            rolling_summary = {
+                "滚动期望总购电费_元": (
+                    rolling_solution.expected_total_cost_yuan
+                ),
+                "滚动实际结算总购电费_元": (
+                    rolling_settled.total_cost_yuan
+                ),
+                "滚动实际紧急购电量_kWh": float(
+                    rolling_settled.emergency_kwh.sum()
+                ),
+                "滚动年末储电量_kWh": float(
+                    rolling_solution.soc_kwh[-1]
+                ),
+            }
+            legacy.log(
+                "滚动回测完成："
+                f"期望费用={rolling_solution.expected_total_cost_yuan:.6f} 元，"
+                f"实际费用={rolling_settled.total_cost_yuan:.6f} 元。"
+            )
 
         point_load = load_point_matrix.reshape(-1)
         point_pv = pv_forecast_matrix.reshape(-1)
@@ -467,6 +608,15 @@ def main() -> None:
             )
 
         legacy.log("步骤7：进行两阶段随机模型灵敏度分析")
+        target_initial_soc = {
+            (target - date(2025, 1, 1)).days: float(
+                stochastic_solution.soc_kwh[
+                    (target - date(2025, 1, 1)).days
+                    * core.PERIODS_PER_DAY
+                ]
+            )
+            for target in core.TARGET_DATES
+        }
         sensitivity = stochastic.run_stochastic_sensitivity(
             load_matrix,
             pv_energy.reshape(core.DAYS, core.PERIODS_PER_DAY),
@@ -478,6 +628,7 @@ def main() -> None:
             n_scenarios=args.scenarios,
             lookback_days=args.lookback_days,
             soc_final_policy=args.soc_final_policy,
+            initial_soc_by_day=target_initial_soc,
             logger=legacy.log,
         )
         sensitivity_summary = (
@@ -540,6 +691,7 @@ def main() -> None:
         stochastic_lp_bound = None
         stochastic_gap = 0.0
         vss_value = 0.0
+        rolling_summary = None
         validation = core.validate_dispatch(
             settled_solution,
             load_energy,
@@ -672,6 +824,7 @@ def main() -> None:
         "约束复核": validation,
         "输出期汇总": output_summary,
         "模型费用": model_summary,
+        "逐日滚动回测": rolling_summary,
         "SOC终端策略对比": terminal_comparison.to_dict(
             orient="records"
         ),
@@ -717,6 +870,7 @@ def main() -> None:
             specified,
             table3,
             output_summary,
+            rolling_summary,
             vss_value,
             args.scenarios,
             args.lookback_days,

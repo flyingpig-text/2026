@@ -1819,6 +1819,11 @@ def parse_args() -> argparse.Namespace:
         help="情景误差抽样的历史回看天数。",
     )
     parser.add_argument(
+        "--rolling-backtest",
+        action="store_true",
+        help="随机模型结束后执行逐日滚动样本外回测。",
+    )
+    parser.add_argument(
         "--milp-time-limit",
         type=float,
         default=900.0,

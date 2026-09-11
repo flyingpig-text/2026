@@ -525,6 +525,134 @@ def solve_stochastic_plan(
     )
 
 
+def solve_rolling_stochastic_plan(
+    load_scenarios_kwh: np.ndarray,
+    pv_scenarios_kwh: np.ndarray,
+    scenario_probabilities: np.ndarray,
+    price_144_yuan_per_kwh: np.ndarray,
+    storage: StorageParameters,
+    *,
+    emergency_multiplier: float = EMERGENCY_MULTIPLIER,
+    initial_soc_kwh: float | None = None,
+    soc_final_policy: str = "free",
+    tie_break_epsilon: float = 1e-6,
+    time_limit_s: float = 60.0,
+    logger: Callable[[str], None] | None = None,
+) -> StochasticSolution:
+    """
+    逐日滚动求解：每天只使用当天情景求解一次，次日继承前一天末SOC。
+
+    该函数用于文档要求的样本外回测，不把全年所有日期合并为一个优化问题。
+    """
+    days, scenario_count, periods = load_scenarios_kwh.shape
+    if periods != PERIODS_PER_DAY:
+        raise ValueError("情景最后一维必须为144。")
+    if scenario_probabilities.shape != (days, scenario_count):
+        raise ValueError("情景概率维度不合法。")
+    storage.validate()
+    if initial_soc_kwh is None:
+        initial_soc_kwh = storage.initial_kwh
+
+    n = days * periods
+    planned = np.empty(n, dtype=float)
+    charge = np.empty(n, dtype=float)
+    discharge = np.empty(n, dtype=float)
+    soc = np.empty(n + 1, dtype=float)
+    scenario_emergency = np.empty(
+        (days, scenario_count, periods),
+        dtype=float,
+    )
+    scenario_curtail = np.empty_like(scenario_emergency)
+    current_soc = initial_soc_kwh
+    solve_seconds = 0.0
+    statuses: list[str] = []
+
+    for day in range(days):
+        day_solution = solve_stochastic_plan(
+            load_scenarios_kwh[day : day + 1],
+            pv_scenarios_kwh[day : day + 1],
+            scenario_probabilities[day : day + 1],
+            price_144_yuan_per_kwh,
+            storage,
+            emergency_multiplier=emergency_multiplier,
+            initial_soc_kwh=current_soc,
+            relax_binary=True,
+            soc_final_policy=soc_final_policy,
+            time_limit_s=time_limit_s,
+            tie_break_epsilon=tie_break_epsilon,
+        )
+        if not day_solution.integer_feasible:
+            day_solution = solve_stochastic_plan(
+                load_scenarios_kwh[day : day + 1],
+                pv_scenarios_kwh[day : day + 1],
+                scenario_probabilities[day : day + 1],
+                price_144_yuan_per_kwh,
+                storage,
+                emergency_multiplier=emergency_multiplier,
+                initial_soc_kwh=current_soc,
+                relax_binary=False,
+                soc_final_policy=soc_final_policy,
+                time_limit_s=time_limit_s,
+                tie_break_epsilon=0.0,
+            )
+        start = day * periods
+        stop = start + periods
+        planned[start:stop] = day_solution.planned_kwh
+        charge[start:stop] = day_solution.charge_kwh
+        discharge[start:stop] = day_solution.discharge_kwh
+        soc[start : stop + 1] = day_solution.soc_kwh
+        scenario_emergency[day] = (
+            day_solution.scenario_emergency_kwh[0]
+        )
+        scenario_curtail[day] = (
+            day_solution.scenario_curtail_kwh[0]
+        )
+        current_soc = float(day_solution.soc_kwh[-1])
+        solve_seconds += day_solution.solve_seconds
+        statuses.append(day_solution.solver_status)
+        if logger is not None and (
+            (day + 1) % 30 == 0 or day + 1 == days
+        ):
+            logger(
+                f"滚动随机规划已完成 {day + 1}/{days} 天，"
+                f"当日末SOC={current_soc:.6f} kWh。"
+            )
+
+    price_all = np.tile(price_144_yuan_per_kwh, days)
+    planned_cost = float(np.dot(price_all, planned))
+    expected_emergency_cost = float(
+        emergency_multiplier
+        * np.sum(
+            scenario_probabilities
+            * np.sum(
+                scenario_emergency
+                * price_all.reshape(days, 1, periods),
+                axis=2,
+            )
+        )
+    )
+    return StochasticSolution(
+        planned_kwh=planned,
+        charge_kwh=charge,
+        discharge_kwh=discharge,
+        soc_kwh=soc,
+        scenario_emergency_kwh=scenario_emergency,
+        scenario_curtail_kwh=scenario_curtail,
+        planned_cost_yuan=planned_cost,
+        expected_emergency_cost_yuan=expected_emergency_cost,
+        expected_total_cost_yuan=planned_cost + expected_emergency_cost,
+        solver_status="逐日滚动；" + " | ".join(
+            sorted(set(statuses))
+        ),
+        solver_success=True,
+        relax_binary=False,
+        solve_seconds=solve_seconds,
+        max_simultaneous_kwh=float(
+            np.max(np.minimum(charge, discharge))
+        ),
+    )
+
+
 def realize_stochastic_plan(
     stochastic_solution: StochasticSolution,
     actual_load_kwh: np.ndarray,
@@ -750,6 +878,7 @@ def run_stochastic_sensitivity(
     n_scenarios: int = 5,
     lookback_days: int = 30,
     soc_final_policy: str = "free",
+    initial_soc_by_day: dict[int, float] | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
     """对指定日期做两阶段随机模型的小规模单因素灵敏度分析。"""
@@ -821,7 +950,12 @@ def run_stochastic_sensitivity(
 
     for target in target_dates:
         day_index = (pd.Timestamp(target) - pd.Timestamp("2025-01-01")).days
-        initial_soc = 6000.0
+        initial_soc = (
+            float(initial_soc_by_day[day_index])
+            if initial_soc_by_day is not None
+            and day_index in initial_soc_by_day
+            else 6000.0
+        )
         case_list: list[
             tuple[
                 str,
