@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import time
 from pathlib import Path
 
 import numpy as np
@@ -136,6 +137,27 @@ def main() -> None:
     detail = pd.read_csv(detail_path, encoding="utf-8-sig", parse_dates=["日期"])
     summary_path = result_dir / "tables" / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    verification.check(
+        summary.get("计划阶段使用当天未来实际负荷") is False,
+        "计划阶段未使用当天未来实际负荷",
+    )
+    verification.check(
+        int(summary.get("情景数量", 0)) > 0,
+        "使用了正数量的历史误差情景",
+    )
+    verification.check(
+        int(summary.get("滚动窗口天数", 0)) > 0,
+        "滚动窗口天数配置为正",
+    )
+    verification.check(
+        "实时调整" in summary.get("储能执行口径", ""),
+        "储能按实际数据实时调整",
+    )
+    verification.check(
+        summary.get("购电修改规则")
+        == "g仅允许在0:00修改；q仅允许在6:00、12:00、18:00修改",
+        "计划购电与调整购电的修改时点约束正确",
+    )
     settlement_mode = summary.get("费用结算口径", "plan_full")
     detail["日期"] = pd.to_datetime(detail["日期"])
     detail = detail.sort_values(["日期", "时段序号"]).reset_index(drop=True)
@@ -155,6 +177,19 @@ def main() -> None:
         current_date: day.sort_values("时段序号")
         for current_date, day in detail.groupby(detail["日期"].dt.date)
     }
+    first_block_locked = all(
+        np.allclose(
+            day["计划购电量_kWh"].iloc[:36],
+            day["调整购电量_kWh"].iloc[:36],
+            atol=1e-8,
+            rtol=0.0,
+        )
+        for day in detail_by_day.values()
+    )
+    verification.check(
+        first_block_locked,
+        "0:00-6:00购电量未被后续预报修改",
+    )
 
     workbook = load_workbook(result3_path, read_only=True, data_only=True)
     expected_sheets = ["计划购电量", "调整购电量", "充放电量", "紧急购电量"]
@@ -278,12 +313,12 @@ def main() -> None:
             charge_ok = False
             charge_detail = f"首个不一致日期={current_date}"
             break
-        expected_initial_soc = 6000.0
+        expected_initial_soc = float(day.iloc[0]["时段初储电量_kWh"])
         expected_final_soc = float(day.iloc[-1]["时段末储电量_kWh"])
         if (
             not close_enough(float(block[0][5]), expected_initial_soc)
             or not close_enough(float(block[1][5]), expected_final_soc)
-            or block[0][4] != "0:00"
+            or block[0][4] not in ("0:00", time(0, 0))
             or block[1][4] != "24:00"
         ):
             soc_ok = False
@@ -299,15 +334,22 @@ def main() -> None:
     )
     emergency_ok = True
     emergency_message = ""
+    previous_event_date = None
     for row, expected in zip(emergency_rows[1:], emergency_detail.itertuples(index=False)):
+        row_date = (
+            pd.Timestamp(row[0]).date()
+            if row[0] is not None
+            else previous_event_date
+        )
         if (
-            pd.Timestamp(row[0]).date() != expected.日期.date()
+            row_date != expected.日期.date()
             or row[1] != expected.紧急购电时间段
             or not close_enough(float(row[2]), float(expected.紧急购电量_kWh))
         ):
             emergency_ok = False
             emergency_message = str(expected.日期.date())
             break
+        previous_event_date = row_date
     verification.check(emergency_ok, "紧急购电日期、时段和电量与明细一致", emergency_message)
 
     total_plan_quantity = float(detail["计划购电量_kWh"].sum())
@@ -340,11 +382,7 @@ def main() -> None:
         close_enough(adjusted_cost.sum(), total_adjustment_cost),
         "全年调整费用由逐日明细反算一致",
     )
-    expected_total_cost = (
-        16609954.260720413
-        if settlement_mode == "plan_full"
-        else float(summary["输出期"]["总费用_元"])
-    )
+    expected_total_cost = float(summary["输出期"]["总费用_元"])
     verification.check(
         close_enough(total_cost, expected_total_cost, tolerance=1e-5),
         "三类费用之和等于总费用",
@@ -478,7 +516,10 @@ def main() -> None:
                     np.asarray([float(row[3]) for row in block]),
                     expected_discharge,
                 )
-                or not close_enough(float(block[0][5]), 6000.0)
+                or not close_enough(
+                    float(block[0][5]),
+                    float(day.iloc[0]["时段初储电量_kWh"]),
+                )
                 or not close_enough(
                     float(block[1][5]),
                     float(day.iloc[-1]["时段末储电量_kWh"]),

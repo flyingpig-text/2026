@@ -12,15 +12,16 @@ import math
 import os
 import re
 import sys
+from copy import copy
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import lil_matrix
@@ -41,6 +42,14 @@ EMERGENCY_MULTIPLIER = 5.0
 DOWN_ADJUSTMENT_MULTIPLIER = 0.5
 UP_ADJUSTMENT_MULTIPLIER = 1.5
 SETTLEMENT_MODES = ("plan_full", "actual_base")
+FOUR_HOUR_BLOCKS = (
+    "0:00-4:00",
+    "4:00-8:00",
+    "8:00-12:00",
+    "12:00-16:00",
+    "16:00-20:00",
+    "20:00-24:00",
+)
 
 
 def load_problem2_module():
@@ -202,6 +211,83 @@ def prepare_actual_data(
         raise ValueError("逐日电价数量与附件2记录数量不一致。")
     data["电价_元每kWh"] = price_values
     return data
+
+
+def build_historical_load_forecast(
+    data: pd.DataFrame,
+    current_date: date,
+    window_days: int = 7,
+    fallback_profile_kwh: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    用当前日期之前的有限历史窗口生成负荷预测情景。
+
+    输入：
+        data：包含日期、时段序号和小负荷电量的长表；
+        current_date：待决策日期；
+        window_days：历史窗口天数，默认7天。
+        fallback_profile_kwh：历史完全不足时的备用基准负荷，长度144，kWh。
+    输出：
+        长度144的历史情景均值负荷电量，kWh。
+
+    该函数严格排除 current_date 当天及未来实际负荷，满足0:00决策的
+    信息集约束。若历史不足，则使用当前日期之前实际存在的全部日期。
+    """
+    if window_days < 1:
+        raise ValueError("历史窗口天数必须为正整数。")
+    start_date = current_date - timedelta(days=window_days)
+    history = data[
+        (data["日期"].dt.date < current_date)
+        & (data["日期"].dt.date >= start_date)
+    ].copy()
+    if history.empty:
+        if fallback_profile_kwh is None:
+            raise ValueError(f"{current_date}之前没有可用于负荷预测的历史数据。")
+        fallback = np.asarray(fallback_profile_kwh, dtype=float)
+        if fallback.shape != (T,) or not np.all(np.isfinite(fallback)):
+            raise ValueError("备用负荷基准必须为长度144的有限数组，单位kWh。")
+        if np.any(fallback < 0.0):
+            raise ValueError("备用负荷基准必须为非负值，单位kWh。")
+        return fallback.copy()
+    profile = (
+        history.groupby("时段序号", as_index=True)["小区负载电量_kWh"]
+        .mean()
+        .sort_index()
+    )
+    if len(profile) != T:
+        raise ValueError(
+            f"{current_date}历史负荷预测仅有{len(profile)}个时段，应为{T}个。"
+        )
+    values = profile.to_numpy(dtype=float)
+    if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError("历史负荷预测必须为有限非负值，单位kWh。")
+    return values
+
+
+def read_attachment1_load_energy(path: Path) -> np.ndarray:
+    """
+    读取附件1的小区负载，用于历史数据不足时的冷启动负荷基准。
+
+    输入：附件1.xlsx路径。
+    输出：长度144的负荷电量，kWh。
+    """
+    raw = pd.read_excel(path, engine="openpyxl")
+    load_column = next(
+        (
+            column
+            for column in raw.columns
+            if "负载" in str(column).replace(" ", "").replace("\n", "")
+        ),
+        None,
+    )
+    if load_column is None:
+        raise ValueError("附件1缺少小区负载列。")
+    load_kw = pd.to_numeric(raw[load_column], errors="raise").to_numpy(dtype=float)
+    if len(load_kw) != T:
+        raise ValueError(f"附件1小区负载必须为{T}个10分钟点，单位kW。")
+    if not np.all(np.isfinite(load_kw)) or np.any(load_kw < 0.0):
+        raise ValueError("附件1小区负载必须为有限非负值，单位kW。")
+    return load_kw * DT_H
 
 
 def hourly_forecast_to_intervals(
@@ -592,6 +678,10 @@ def dataframe_row_for_day(
     day = data[data["日期"].dt.date == current_date].sort_values("时段序号")
     if len(day) != T:
         raise ValueError(f"{current_date}缺少144个10分钟记录。")
+    decision_load = np.asarray(
+        result.get("decision_load_kwh", day["小区负载电量_kWh"].to_numpy(dtype=float)),
+        dtype=float,
+    )
     detail_rows: list[dict[str, object]] = []
     for index, row in enumerate(day.itertuples(index=False)):
         detail_rows.append(
@@ -602,6 +692,8 @@ def dataframe_row_for_day(
                 "电价_元每kWh": float(row.电价_元每kWh),
                 "小区负载_kW": float(row.小区负载_kW),
                 "小区负载电量_kWh": float(row.小区负载电量_kWh),
+                "决策用负荷预测_kW": float(decision_load[index] / DT_H),
+                "决策用负荷预测电量_kWh": float(decision_load[index]),
                 "光伏实际_kW": float(row.光伏实际功率_kW),
                 "光伏0时预报_kW": float(result["forecast0_kw"][index]),
                 "最终采用预报_kW": float(result["latest_forecast_kw"][index]),
@@ -611,6 +703,7 @@ def dataframe_row_for_day(
                 "放电量_kWh": float(result["discharge_kwh"][index]),
                 "紧急购电量_kWh": float(result["emergency_purchase_kwh"][index]),
                 "实际弃光量_kWh": float(result["actual_curtail_kwh"][index]),
+                "时段初储电量_kWh": float(result["soc_kwh"][index]),
                 "时段末储电量_kWh": float(result["soc_kwh"][index + 1]),
                 "计划购电费_元": float(result["plan_cost_kwh_yuan"][index]),
                 "调整费用_元": float(result["adjustment_cost_yuan"][index]),
@@ -621,6 +714,7 @@ def dataframe_row_for_day(
     daily = {
         "日期": current_date,
         "小区负载电量_kWh": float(day["小区负载电量_kWh"].sum()),
+        "决策用负荷预测电量_kWh": float(decision_load.sum()),
         "光伏实际电量_kWh": float(day["光伏实际电量_kWh"].sum()),
         "计划购电量_kWh": float(result["plan_purchase_kwh"].sum()),
         "调整购电量_kWh": float(result["adjusted_purchase_kwh"].sum()),
@@ -704,15 +798,23 @@ def write_wide_sheet(
     cost_title: str,
 ) -> None:
     """把逐10分钟序列写为日期×144时段的宽表。"""
-    worksheet.delete_rows(2, worksheet.max_row)
-    # 保留官方模板的表头文字和时段标签，不再重写为自定义自然区间。
     if worksheet.max_column < 147:
         raise ValueError("结果模板宽表列数不足147列。")
 
     dates = sorted(detail["日期"].dt.date.unique())
+    template_dates = [
+        worksheet.cell(row_index, 1).value.date()
+        for row_index in range(2, worksheet.max_row + 1)
+        if isinstance(worksheet.cell(row_index, 1).value, datetime)
+    ]
+    if template_dates and template_dates != dates:
+        raise ValueError(
+            "宽表日期必须与官方模板逐行一致："
+            f"模板{len(template_dates)}天，结果{len(dates)}天。"
+        )
+    # 官方模板的表头、样式和日期行全部保留，只覆盖数值单元格。
     for row_index, current_date in enumerate(dates, start=2):
         day = detail[detail["日期"].dt.date == current_date].sort_values("时段序号")
-        worksheet.cell(row_index, 1, datetime.combine(current_date, time.min))
         for period_index, value in enumerate(
             day[value_column].to_numpy(dtype=float),
             start=2,
@@ -805,20 +907,117 @@ def write_emergency_sheet(
     if worksheet.max_column < 3 or worksheet.cell(1, 1).value is None:
         raise ValueError("紧急购电量模板表头不完整。")
     events = merge_contiguous_emergency_events(detail)
+    first_style = copy(worksheet.cell(2, 1)._style)
+    for row_index in range(2, worksheet.max_row + 1):
+        for column in range(1, 4):
+            worksheet.cell(row_index, column).value = None
     if events.empty:
+        worksheet.delete_rows(2, worksheet.max_row)
+        worksheet.cell(2, 1)._style = first_style
         return
 
-    worksheet.delete_rows(2, worksheet.max_row)
     row_index = 2
+    previous_date: date | None = None
     for row in events.itertuples(index=False):
-        worksheet.cell(
-            row_index,
-            1,
-            datetime.combine(row.日期.date(), time.min),
-        )
+        current_date = row.日期.date()
+        for column in range(1, 4):
+            target = worksheet.cell(row_index, column)
+            target._style = copy(
+                worksheet.cell(
+                    2 if previous_date != current_date else 3,
+                    column,
+                )._style
+            )
+        if previous_date != current_date:
+            worksheet.cell(
+                row_index,
+                1,
+                datetime.combine(current_date, time.min),
+            )
         worksheet.cell(row_index, 2, row.紧急购电时间段)
         worksheet.cell(row_index, 3, float(row.紧急购电量_kWh))
+        worksheet.row_dimensions[row_index].height = 14
+        previous_date = current_date
         row_index += 1
+    if worksheet.max_row >= row_index:
+        worksheet.delete_rows(row_index, worksheet.max_row - row_index + 1)
+
+
+def write_charge_sheet(
+    worksheet,
+    detail: pd.DataFrame,
+    storage,
+) -> None:
+    """按官方模板样式写入334天的4小时充放电量与首末储电量。"""
+    expected_header = ("日期", "时间段", "充电量", "放电量", "时刻", "储电量")
+    actual_header = tuple(worksheet.cell(1, column).value for column in range(1, 7))
+    if actual_header != expected_header:
+        raise ValueError(f"充放电量表头必须为{expected_header}，实际为{actual_header}。")
+
+    prototype_styles = [
+        [copy(worksheet.cell(row_index, column)._style) for column in range(1, 7)]
+        for row_index in range(2, 8)
+    ]
+    for row_index in range(2, worksheet.max_row + 1):
+        for column in range(1, 7):
+            worksheet.cell(row_index, column).value = None
+
+    dates = sorted(detail["日期"].dt.date.unique())
+    required_rows = 1 + len(dates) * 6
+    if required_rows > worksheet.max_row:
+        for row_index in range(worksheet.max_row + 1, required_rows + 1):
+            for column in range(1, 7):
+                worksheet.cell(row_index, column)
+    if worksheet.max_row > required_rows:
+        worksheet.delete_rows(required_rows + 1, worksheet.max_row - required_rows)
+
+    for day_index, current_date in enumerate(dates):
+        day = detail[
+            detail["日期"].dt.date == current_date
+        ].sort_values("时段序号")
+        if len(day) != T:
+            raise ValueError(f"{current_date}结果不足{T}个时段。")
+        charge_blocks = [
+            float(day["充电量_kWh"].iloc[index : index + 24].sum())
+            for index in range(0, T, 24)
+        ]
+        discharge_blocks = [
+            float(day["放电量_kWh"].iloc[index : index + 24].sum())
+            for index in range(0, T, 24)
+        ]
+        start_row = 2 + day_index * 6
+        for block_index in range(6):
+            row_index = start_row + block_index
+            worksheet.row_dimensions[row_index].height = 14
+            for column in range(1, 7):
+                worksheet.cell(row_index, column)._style = copy(
+                    prototype_styles[block_index][column - 1]
+                )
+            if block_index == 0:
+                worksheet.cell(
+                    row_index,
+                    1,
+                    datetime.combine(current_date, time.min),
+                )
+            worksheet.cell(row_index, 2, FOUR_HOUR_BLOCKS[block_index])
+            worksheet.cell(row_index, 3, charge_blocks[block_index])
+            worksheet.cell(row_index, 4, discharge_blocks[block_index])
+        if "时段初储电量_kWh" in day.columns:
+            start_soc = float(day.iloc[0]["时段初储电量_kWh"])
+        else:
+            start_soc = (
+                float(day.iloc[0]["时段末储电量_kWh"])
+                - storage.efficiency * float(day.iloc[0]["充电量_kWh"])
+                + float(day.iloc[0]["放电量_kWh"]) / storage.efficiency
+            )
+        worksheet.cell(start_row, 5, time(0, 0))
+        worksheet.cell(start_row, 6, start_soc)
+        worksheet.cell(start_row + 1, 5, "24:00")
+        worksheet.cell(
+            start_row + 1,
+            6,
+            float(day.iloc[-1]["时段末储电量_kWh"]),
+        )
 
 
 def write_official_result(
@@ -857,51 +1056,8 @@ def write_official_result(
             "全天调整购电量(kWh)",
             "全天调整费用(元)",
         )
-    p2.write_charge_sheet(workbook["充放电量"], detail, storage)
-    # 严格恢复官方模板字段名，不在结果表头中添加单位括号。
-    charge_sheet = workbook["充放电量"]
-    charge_sheet.cell(1, 3, "充电量")
-    charge_sheet.cell(1, 4, "放电量")
-    charge_sheet.cell(1, 6, "储电量")
+    write_charge_sheet(workbook["充放电量"], detail, storage)
     write_emergency_sheet(workbook["紧急购电量"], detail)
-
-    for worksheet in workbook.worksheets:
-        # 官方模板使用宋体10号、全部居中且标题不加粗。
-        worksheet.freeze_panes = None
-        sheet_font = Font(name="宋体", size=10)
-        sheet_alignment = Alignment(horizontal="center", vertical="center")
-        thin_side = Side(style="thin")
-        sheet_border = Border(
-            left=thin_side,
-            right=thin_side,
-            top=thin_side,
-            bottom=thin_side,
-        )
-        for row in worksheet.iter_rows():
-            worksheet.row_dimensions[row[0].row].height = 14
-            for cell in row:
-                cell.font = sheet_font
-                cell.alignment = sheet_alignment
-                if worksheet.title in {"充放电量", "紧急购电量"}:
-                    cell.border = sheet_border
-        worksheet.column_dimensions["A"].width = 12.633
-        for cell in worksheet["A"][1:]:
-            cell.number_format = "mm-dd-yy"
-        if worksheet.title in {"计划购电量", "调整购电量"}:
-            worksheet.column_dimensions["A"].width = 13
-            for column in range(2, 148):
-                worksheet.column_dimensions[get_column_letter(column)].width = 17
-        elif worksheet.title == "充放电量":
-            worksheet.column_dimensions["A"].width = 12.633
-            worksheet.column_dimensions["B"].width = 12.0
-            worksheet.column_dimensions["C"].width = 18.0
-            worksheet.column_dimensions["D"].width = 18.0
-            worksheet.column_dimensions["E"].width = 12.0
-            worksheet.column_dimensions["F"].width = 18.0
-        elif worksheet.title == "紧急购电量":
-            worksheet.column_dimensions["A"].width = 12.633
-            worksheet.column_dimensions["B"].width = 14.0
-            worksheet.column_dimensions["C"].width = 18.0
     workbook.save(output_path)
     workbook.close()
 
@@ -1038,22 +1194,24 @@ def validate_result_detail(
     max_soc_error = 0.0
     max_power_error = 0.0
     max_balance_error = 0.0
-    max_start_end_error = 0.0
+    max_cross_day_soc_error = 0.0
     total_emergency = 0.0
+    previous_final_soc: float | None = None
     for current_date, day in detail.groupby(detail["日期"].dt.date):
         day = day.sort_values("时段序号")
         if len(day) != T:
             raise ValueError(f"{current_date}结果不足144个时段。")
         charge = day["充电量_kWh"].to_numpy(dtype=float)
         discharge = day["放电量_kWh"].to_numpy(dtype=float)
+        start_soc = float(day.iloc[0]["时段初储电量_kWh"])
         soc = np.concatenate(
             (
-                [storage.initial_kwh],
+                [start_soc],
                 day["时段末储电量_kWh"].to_numpy(dtype=float),
             )
         )
         recursive = compute_soc(
-            storage.initial_kwh,
+            start_soc,
             charge,
             discharge,
             storage.efficiency,
@@ -1100,10 +1258,12 @@ def validate_result_detail(
                 max_balance_error,
                 float(np.max(np.abs(balance))),
             )
-        max_start_end_error = max(
-            max_start_end_error,
-            abs(float(soc[0] - soc[-1])),
-        )
+        if previous_final_soc is not None:
+            max_cross_day_soc_error = max(
+                max_cross_day_soc_error,
+                abs(start_soc - previous_final_soc),
+            )
+        previous_final_soc = float(soc[-1])
         if soc.min() < storage.soc_min_kwh - tolerance:
             raise ValueError(f"{current_date} SOC低于下限。")
         if soc.max() > storage.soc_max_kwh + tolerance:
@@ -1114,12 +1274,12 @@ def validate_result_detail(
         raise ValueError(f"充放电功率超过上限：{max_power_error:.10f} kW。")
     if max_balance_error > tolerance:
         raise ValueError(f"电能平衡校验失败：{max_balance_error:.10f} kWh。")
-    if max_start_end_error > tolerance:
-        raise ValueError(f"首末SOC不一致：{max_start_end_error:.10f} kWh。")
+    if max_cross_day_soc_error > tolerance:
+        raise ValueError(f"跨日SOC不连续：{max_cross_day_soc_error:.10f} kWh。")
     return {
         "最大SOC递推残差_kWh": max_soc_error,
         "最大充放电功率_kW": max_power_error,
         "最大电能平衡残差_kWh": max_balance_error,
-        "最大首末SOC误差_kWh": max_start_end_error,
+        "最大跨日SOC断点_kWh": max_cross_day_soc_error,
         "紧急购电量合计_kWh": total_emergency,
     }

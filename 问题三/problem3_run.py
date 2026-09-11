@@ -37,6 +37,7 @@ from problem3_core import (
     merge_contiguous_emergency_events,
     prepare_actual_data,
     print_quantity_checks,
+    read_attachment1_load_energy,
     read_attachment3,
     summarize_specified_dates,
     validate_result_detail,
@@ -44,6 +45,10 @@ from problem3_core import (
     write_specified_date_workbook,
 )
 from problem3_algorithm import run_rolling_day
+from problem3_scenarios import (
+    build_causal_load_forecast,
+    build_day_scenario_windows,
+)
 
 
 plt.rcParams["font.sans-serif"] = [
@@ -81,6 +86,36 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="结果目录；默认写入问题三/results。",
+    )
+    parser.add_argument(
+        "--scenarios",
+        type=int,
+        default=5,
+        help="每个决策时刻使用的历史误差情景数，默认5。",
+    )
+    parser.add_argument(
+        "--scenario-lookback-days",
+        type=int,
+        default=30,
+        help="历史误差情景回看天数，默认30。",
+    )
+    parser.add_argument(
+        "--window-days",
+        type=int,
+        default=3,
+        help="情景滚动优化窗口天数，默认3。",
+    )
+    parser.add_argument(
+        "--terminal-value-factor",
+        type=float,
+        default=1.0,
+        help="窗口末端单位储能价值倍率，默认1.0。",
+    )
+    parser.add_argument(
+        "--scenario-time-limit",
+        type=float,
+        default=60.0,
+        help="单个情景窗口MILP时间上限，单位秒，默认60。",
     )
     return parser.parse_args()
 
@@ -146,19 +181,45 @@ def solve_problem3(
     storage,
     settlement_mode: str = "plan_full",
     decision_price_by_date: dict[date, np.ndarray] | None = None,
+    fallback_load_profile_kwh: np.ndarray | None = None,
+    scenario_count: int = 5,
+    scenario_lookback_days: int = 30,
+    window_days: int = 3,
+    terminal_soc_value_yuan_per_kwh: float = 0.0,
+    scenario_time_limit_s: float = 60.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """逐日运行0:00计划和滚动调整。"""
+    """从1月1日开始连续运行，输出2月1日至12月31日的滚动结果。"""
     detail_rows: list[dict[str, object]] = []
     daily_rows: list[dict[str, object]] = []
     scenario_rows: list[dict[str, object]] = []
-    dates = output_dates(data)
-    print(f"问题3开始求解：{len(dates)}天，每天144个10分钟时段。")
-    for number, current_date in enumerate(dates, start=1):
+    all_dates = sorted(data["日期"].dt.date.unique())
+    output_period_dates = output_dates(data)
+    current_soc_kwh = float(storage.initial_kwh)
+    print(
+        f"问题3开始连续求解：{len(all_dates)}天，"
+        f"输出{len(output_period_dates)}天，每天144个10分钟时段。"
+    )
+    for number, current_date in enumerate(all_dates, start=1):
         day = data[data["日期"].dt.date == current_date].sort_values("时段序号")
+        decision_load = build_causal_load_forecast(
+            data,
+            current_date,
+            fallback_load_profile_kwh,
+        )
         decision_price = (
             decision_price_by_date[current_date]
             if decision_price_by_date is not None
             else day["电价_元每kWh"].to_numpy(dtype=float)
+        )
+        scenario_windows = build_day_scenario_windows(
+            data,
+            forecasts,
+            current_date,
+            decision_price,
+            fallback_load_profile_kwh,
+            scenario_count=scenario_count,
+            lookback_days=scenario_lookback_days,
+            window_days=window_days,
         )
         rolling = run_rolling_day(
             load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
@@ -166,18 +227,27 @@ def solve_problem3(
             price_yuan_per_kwh=day["电价_元每kWh"].to_numpy(dtype=float),
             forecast_by_hour=forecasts[current_date],
             storage=storage,
+            initial_soc_kwh=current_soc_kwh,
             settlement_mode=settlement_mode,
             decision_price_yuan_per_kwh=decision_price,
+            forecast_load_energy_kwh=decision_load,
+            scenario_windows_by_hour=scenario_windows,
+            live_storage_execution=True,
+            terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
+            scenario_time_limit_s=scenario_time_limit_s,
         )
         result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
+        current_soc_kwh = float(result["soc_kwh"][-1])
+        if not (OUTPUT_START <= current_date <= OUTPUT_END):
+            continue
         rows, daily = dataframe_row_for_day(current_date, data, result)
         detail_rows.extend(rows)
         daily_rows.append(daily)
         for scenario in result["scenarios"]:
             scenario_rows.append({"日期": current_date, **scenario})
-        if number % 30 == 0 or number == len(dates):
+        if len(daily_rows) % 30 == 0 or current_date == OUTPUT_END:
             print(
-                f"问题3完成 {number:>3}/{len(dates)} 天：{current_date}，"
+                f"问题3输出完成 {len(daily_rows):>3}/{len(output_period_dates)} 天：{current_date}，"
                 f"调整购电={daily['调整购电量_kWh']:.6f} kWh，"
                 f"紧急购电={daily['紧急购电量_kWh']:.6f} kWh，"
                 f"总费用={daily['总费用_元']:.6f} 元。"
@@ -341,7 +411,7 @@ def write_table2_excel(
         worksheet.cell(
             start_row,
             6,
-            float(storage.initial_kwh),
+            float(day.iloc[0]["时段初储电量_kWh"]),
         )
         worksheet.cell(start_row + 1, 5, "24:00")
         worksheet.cell(
@@ -388,20 +458,60 @@ def run_forecast_sensitivity(
     forecasts: dict[date, dict[int, np.ndarray]],
     storage,
     settlement_mode: str = "plan_full",
+    initial_soc_by_date: dict[date, float] | None = None,
+    scenario_count: int = 5,
+    scenario_lookback_days: int = 30,
+    window_days: int = 3,
+    terminal_soc_value_yuan_per_kwh: float = 0.0,
+    scenario_time_limit_s: float = 60.0,
+    fallback_profile_kwh: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """对指定日期进行预报整体缩放灵敏度分析。"""
     rows: list[dict[str, object]] = []
     for target in TARGET_DATES:
         day = data[data["日期"].dt.date == target].sort_values("时段序号")
+        initial_soc = (
+            storage.initial_kwh
+            if initial_soc_by_date is None
+            else initial_soc_by_date[target]
+        )
+        decision_load = build_causal_load_forecast(
+            data,
+            target,
+            fallback_profile_kwh
+            if fallback_profile_kwh is not None
+            else day["小区负载电量_kWh"].to_numpy(dtype=float),
+        )
         for scale in (0.90, 0.95, 1.00, 1.05, 1.10):
+            scenario_windows = build_day_scenario_windows(
+                data,
+                forecasts,
+                target,
+                day["电价_元每kWh"].to_numpy(dtype=float),
+                fallback_profile_kwh=(
+                    fallback_profile_kwh
+                    if fallback_profile_kwh is not None
+                    else day["小区负载电量_kWh"].to_numpy(dtype=float)
+                ),
+                scenario_count=scenario_count,
+                lookback_days=scenario_lookback_days,
+                window_days=window_days,
+                forecast_scale=scale,
+            )
             rolling = run_rolling_day(
                 load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
                 actual_pv_energy_kwh=day["光伏实际电量_kWh"].to_numpy(dtype=float),
                 price_yuan_per_kwh=day["电价_元每kWh"].to_numpy(dtype=float),
                 forecast_by_hour=forecasts[target],
                 storage=storage,
+                initial_soc_kwh=initial_soc,
                 forecast_scale=scale,
                 settlement_mode=settlement_mode,
+                forecast_load_energy_kwh=decision_load,
+                scenario_windows_by_hour=scenario_windows,
+                live_storage_execution=True,
+                terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
+                scenario_time_limit_s=scenario_time_limit_s,
             )
             result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             rows.append(
@@ -585,6 +695,10 @@ def write_report(
     sensitivity: pd.DataFrame,
     storage,
     settlement_mode: str,
+    scenario_count: int,
+    scenario_lookback_days: int,
+    window_days: int,
+    terminal_soc_value_yuan_per_kwh: float,
 ) -> None:
     """写出问题3结果说明。"""
     period = daily[
@@ -624,6 +738,19 @@ def write_report(
         "更新至18:00",
         "紧急购电量_kWh",
     )
+    def update_verdict(absolute: float, relative: float) -> str:
+        """根据费用改善方向生成更新时点结论。"""
+        if absolute > 0.0 and relative >= 0.1:
+            return "改善较明显，建议保留"
+        if absolute > 0.0:
+            return "改善很小，可按通信和计算成本决定是否保留"
+        if abs(absolute) <= 1e-6:
+            return "基本没有增量价值"
+        return "费用略升，不建议只为此增加该更新时点"
+
+    verdict_6 = update_verdict(cost_0_6, cost_0_6_pct)
+    verdict_12 = update_verdict(cost_6_12, cost_6_12_pct)
+    verdict_18 = update_verdict(cost_12_18, cost_12_18_pct)
 
     def csv_block(frame: pd.DataFrame) -> str:
         """用CSV文本展示表格，避免依赖可选的tabulate包。"""
@@ -636,12 +763,23 @@ def write_report(
         "",
         "- 附件3的“预报k小时”解释为发布时刻后第k小时的平均光伏功率，单位kW。",
         "- 每小时预报在6个10分钟区间内保持不变，电量按 功率×0.1666666667 h 计算。",
-        "- 每天0:00使用0:00预报制定计划。",
-        "- 6:00、12:00、18:00只修订此后尚未执行的时段。",
+        "- 负荷基准仅使用当前日期之前的同星期历史实际曲线；历史不足时回退到"
+        "此前最多7天均值，不读取当天未来实际负荷。",
+        f"- 每天从此前{scenario_lookback_days}天预测残差中选取"
+        f"{scenario_count}个代表情景，负荷和光伏误差成对进入优化。",
+        "- 光伏情景以附件3对应发布时刻的实际预报为基准，并叠加同发布时刻、"
+        "同提前期的历史预报误差。",
+        f"- 情景生成参考{window_days}天跨日窗口，实时执行使用单位储能价值"
+        f" {terminal_soc_value_yuan_per_kwh:.6f} 元/kWh。",
+        "- 每天0:00使用0:00预报确定计划购电量g，g在当天剩余时段锁定。",
+        "- 6:00、12:00、18:00只更新此后尚未执行时段的购电量q，不回改g。",
+        "- 充放电量c、d按实际负荷和实际光伏逐10分钟实时调整，"
+        "每个时刻只使用当前及过去真实数据。",
         "- 计划购电量高于调整购电量部分按交易时刻电价50%计违约费用。",
         "- 调整购电量高于计划购电量部分按交易时刻电价150%计费。",
         "- 最终实际光伏与预报的偏差由紧急购电或弃光结算。",
-        "- 储能每天0:00和24:00均为6000 kWh。",
+        "- 储能从2025-01-01 0:00的6000 kWh开始，跨日连续运行；"
+        "前一日24:00储电量作为次日0:00初值，不要求每日回到6000 kWh。",
         f"- 费用结算口径：{settlement_mode}。",
         "",
         "## 储能参数",
@@ -687,8 +825,9 @@ def write_report(
         f"（{cost_12_18_pct:.6f}%），紧急购电量再下降 "
         f"{emergency_12_18:.6f} kWh（{emergency_12_18_pct:.6f}%）。",
         "",
-        "结论：6:00和12:00预报产生明显的费用及紧急购电下降，应保留；"
-        "18:00预报的增量收益极小，可保留为可选更新或仅在预报显著变化时启用。",
+        f"结论：6:00预报相对0:00预报{verdict_6}；"
+        f"12:00相对6:00预报{verdict_12}；"
+        f"18:00相对12:00预报{verdict_18}。",
         "",
         "仍需关注小时预报与10分钟实际光伏的误差，因为它会造成小时内功率不匹配。",
         "",
@@ -705,6 +844,16 @@ def main() -> None:
     """问题3主流程。"""
     configure_console()
     args = parse_args()
+    if args.scenarios <= 0:
+        raise ValueError("情景数量必须为正整数。")
+    if args.scenario_lookback_days <= 0:
+        raise ValueError("历史误差回看天数必须为正整数。")
+    if args.window_days <= 0:
+        raise ValueError("滚动窗口天数必须为正整数。")
+    if args.terminal_value_factor < 0.0:
+        raise ValueError("终端储能价值倍率不能为负。")
+    if args.scenario_time_limit <= 0.0:
+        raise ValueError("情景MILP时间上限必须为正。")
     script_dir = Path(__file__).resolve().parent
     p2 = load_problem2_module()
     inputs = locate_inputs(script_dir)
@@ -712,6 +861,7 @@ def main() -> None:
     forecasts = read_attachment3(inputs["attachment3"])
 
     base_price = p2.read_price_curve(inputs["attachment1"])
+    fallback_load_profile = read_attachment1_load_energy(inputs["attachment1"])
     all_dates = pd.date_range("2025-01-01", "2025-12-31", freq="D").date
     price_by_date = {current_date: base_price.copy() for current_date in all_dates}
     data = prepare_actual_data(p2, inputs["attachment2"], price_by_date)
@@ -726,6 +876,10 @@ def main() -> None:
         f"效率={storage.efficiency:.6f}。"
     )
     print_quantity_checks(data, forecasts, "附件1电价")
+    terminal_soc_value = (
+        args.terminal_value_factor
+        * float(np.mean(base_price[:30]) / storage.efficiency)
+    )
 
     # 所有代码和输出均位于“问题三”目录内；脚本可从任意当前目录启动。
     output_dir = (
@@ -746,6 +900,12 @@ def main() -> None:
         forecasts,
         storage,
         args.settlement_mode,
+        fallback_load_profile_kwh=fallback_load_profile,
+        scenario_count=args.scenarios,
+        scenario_lookback_days=args.scenario_lookback_days,
+        window_days=args.window_days,
+        terminal_soc_value_yuan_per_kwh=terminal_soc_value,
+        scenario_time_limit_s=args.scenario_time_limit,
     )
     specified = summarize_specified_dates(daily, include_adjustment=True)
     validation = validate_result_detail(detail, storage, include_adjustment=True)
@@ -759,6 +919,16 @@ def main() -> None:
         forecasts,
         storage,
         args.settlement_mode,
+        initial_soc_by_date={
+            row["日期"].date(): float(row["0:00储电量_kWh"])
+            for _, row in daily.iterrows()
+        },
+        scenario_count=args.scenarios,
+        scenario_lookback_days=args.scenario_lookback_days,
+        window_days=args.window_days,
+        terminal_soc_value_yuan_per_kwh=terminal_soc_value,
+        scenario_time_limit_s=args.scenario_time_limit,
+        fallback_profile_kwh=fallback_load_profile,
     )
     scenario_summary = aggregate_forecast_scenarios(
         scenarios.to_dict(orient="records")
@@ -841,6 +1011,10 @@ def main() -> None:
         sensitivity,
         storage,
         args.settlement_mode,
+        args.scenarios,
+        args.scenario_lookback_days,
+        args.window_days,
+        terminal_soc_value,
     )
     summary = {
         "输出期": {
@@ -853,6 +1027,16 @@ def main() -> None:
             "总费用_元": float(daily["总费用_元"].sum()),
         },
         "费用结算口径": args.settlement_mode,
+        "储能边界口径": "2025-01-01至12-31跨日连续，前一日最终SOC作为次日初值",
+        "储能执行口径": "0:00锁定计划购电g，预报点更新调整购电量q，充放电量按实际数据实时调整",
+        "购电修改规则": "g仅允许在0:00修改；q仅允许在6:00、12:00、18:00修改",
+        "负荷预测口径": "当前日期之前同星期历史实际曲线，并叠加历史预测误差情景",
+        "光伏预测口径": "附件3对应发布时刻预报，并叠加历史同提前期预报误差情景",
+        "情景数量": args.scenarios,
+        "历史误差回看天数": args.scenario_lookback_days,
+        "滚动窗口天数": args.window_days,
+        "终端储能价值_元每kWh": terminal_soc_value,
+        "计划阶段使用当天未来实际负荷": False,
         "约束校验": validation,
         "指定日期结果": specified.assign(
             日期=specified["日期"].dt.strftime("%Y-%m-%d")
