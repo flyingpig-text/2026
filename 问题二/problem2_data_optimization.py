@@ -880,10 +880,9 @@ def write_charge_sheet(
     storage: StorageParams,
 ) -> None:
     """写入“充放电量”工作表，每天6个4小时块并记录首末储电量。"""
+    if worksheet.max_column < 6 or worksheet.cell(1, 1).value is None:
+        raise ValueError("充放电量模板表头不完整。")
     worksheet.delete_rows(2, worksheet.max_row)
-    headers = ["日期", "时间段", "充电量(kWh)", "放电量(kWh)", "时刻", "储电量(kWh)"]
-    for column_index, header in enumerate(headers, start=1):
-        worksheet.cell(1, column_index, header)
 
     output_detail = detail[
         (detail["日期"].dt.date >= OUTPUT_START)

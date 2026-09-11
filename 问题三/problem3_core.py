@@ -796,12 +796,19 @@ def write_emergency_sheet(
     period_header: str = "购电时间段",
     value_header: str = "购电量",
 ) -> None:
-    """写入合并连续时段后的紧急购电事件。"""
-    worksheet.delete_rows(2, worksheet.max_row)
-    worksheet.cell(1, 1, date_header)
-    worksheet.cell(1, 2, period_header)
-    worksheet.cell(1, 3, value_header)
+    """
+    写入合并连续时段后的紧急购电事件。
+
+    表头严格保留官方模板。若无紧急购电事件，则不删除官方模板中的
+    日期占位行，也不生成任何虚构的紧急购电记录。
+    """
+    if worksheet.max_column < 3 or worksheet.cell(1, 1).value is None:
+        raise ValueError("紧急购电量模板表头不完整。")
     events = merge_contiguous_emergency_events(detail)
+    if events.empty:
+        return
+
+    worksheet.delete_rows(2, worksheet.max_row)
     row_index = 2
     for row in events.itertuples(index=False):
         worksheet.cell(
