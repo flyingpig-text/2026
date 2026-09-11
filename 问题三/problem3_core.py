@@ -20,7 +20,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import lil_matrix
@@ -793,8 +793,8 @@ def write_emergency_sheet(
     worksheet,
     detail: pd.DataFrame,
     date_header: str = "日期",
-    period_header: str = "紧急购电时间段",
-    value_header: str = "紧急购电量(kWh)",
+    period_header: str = "购电时间段",
+    value_header: str = "购电量",
 ) -> None:
     """写入合并连续时段后的紧急购电事件。"""
     worksheet.delete_rows(2, worksheet.max_row)
@@ -851,18 +851,50 @@ def write_official_result(
             "全天调整费用(元)",
         )
     p2.write_charge_sheet(workbook["充放电量"], detail, storage)
+    # 严格恢复官方模板字段名，不在结果表头中添加单位括号。
+    charge_sheet = workbook["充放电量"]
+    charge_sheet.cell(1, 3, "充电量")
+    charge_sheet.cell(1, 4, "放电量")
+    charge_sheet.cell(1, 6, "储电量")
     write_emergency_sheet(workbook["紧急购电量"], detail)
 
     for worksheet in workbook.worksheets:
-        worksheet.freeze_panes = "B2"
-        worksheet.row_dimensions[1].height = 24
-        for cell in worksheet[1]:
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+        # 官方模板使用宋体10号、全部居中且标题不加粗。
+        worksheet.freeze_panes = None
+        sheet_font = Font(name="宋体", size=10)
+        sheet_alignment = Alignment(horizontal="center", vertical="center")
+        thin_side = Side(style="thin")
+        sheet_border = Border(
+            left=thin_side,
+            right=thin_side,
+            top=thin_side,
+            bottom=thin_side,
+        )
+        for row in worksheet.iter_rows():
+            worksheet.row_dimensions[row[0].row].height = 14
+            for cell in row:
+                cell.font = sheet_font
+                cell.alignment = sheet_alignment
+                if worksheet.title in {"充放电量", "紧急购电量"}:
+                    cell.border = sheet_border
+        worksheet.column_dimensions["A"].width = 12.633
+        for cell in worksheet["A"][1:]:
+            cell.number_format = "mm-dd-yy"
         if worksheet.title in {"计划购电量", "调整购电量"}:
             worksheet.column_dimensions["A"].width = 13
             for column in range(2, 148):
                 worksheet.column_dimensions[get_column_letter(column)].width = 17
+        elif worksheet.title == "充放电量":
+            worksheet.column_dimensions["A"].width = 12.633
+            worksheet.column_dimensions["B"].width = 12.0
+            worksheet.column_dimensions["C"].width = 18.0
+            worksheet.column_dimensions["D"].width = 18.0
+            worksheet.column_dimensions["E"].width = 12.0
+            worksheet.column_dimensions["F"].width = 18.0
+        elif worksheet.title == "紧急购电量":
+            worksheet.column_dimensions["A"].width = 12.633
+            worksheet.column_dimensions["B"].width = 14.0
+            worksheet.column_dimensions["C"].width = 18.0
     workbook.save(output_path)
     workbook.close()
 

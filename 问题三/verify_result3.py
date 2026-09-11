@@ -240,8 +240,12 @@ def main() -> None:
         f"实际行数={len(charge_rows)}",
     )
     verification.check(
-        charge_rows[0] == ("日期", "时间段", "充电量(kWh)", "放电量(kWh)", "时刻", "储电量(kWh)"),
+        charge_rows[0] == ("日期", "时间段", "充电量", "放电量", "时刻", "储电量"),
         "充放电量表头格式正确",
+    )
+    verification.check(
+        emergency_rows[0] == ("日期", "购电时间段", "购电量"),
+        "紧急购电量表头格式正确",
     )
     charge_ok = True
     soc_ok = True
