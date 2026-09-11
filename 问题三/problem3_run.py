@@ -145,6 +145,7 @@ def solve_problem3(
     forecasts: dict[date, dict[int, np.ndarray]],
     storage,
     settlement_mode: str = "plan_full",
+    decision_price_by_date: dict[date, np.ndarray] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """逐日运行0:00计划和滚动调整。"""
     detail_rows: list[dict[str, object]] = []
@@ -154,6 +155,11 @@ def solve_problem3(
     print(f"问题3开始求解：{len(dates)}天，每天144个10分钟时段。")
     for number, current_date in enumerate(dates, start=1):
         day = data[data["日期"].dt.date == current_date].sort_values("时段序号")
+        decision_price = (
+            decision_price_by_date[current_date]
+            if decision_price_by_date is not None
+            else day["电价_元每kWh"].to_numpy(dtype=float)
+        )
         rolling = run_rolling_day(
             load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
             actual_pv_energy_kwh=day["光伏实际电量_kWh"].to_numpy(dtype=float),
@@ -161,6 +167,7 @@ def solve_problem3(
             forecast_by_hour=forecasts[current_date],
             storage=storage,
             settlement_mode=settlement_mode,
+            decision_price_yuan_per_kwh=decision_price,
         )
         result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
         rows, daily = dataframe_row_for_day(current_date, data, result)

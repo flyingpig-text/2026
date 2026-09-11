@@ -621,6 +621,7 @@ def run_rolling_day(
     storage,
     forecast_scale: float = 1.0,
     settlement_mode: str = "plan_full",
+    decision_price_yuan_per_kwh: np.ndarray | None = None,
 ) -> RollingDayResult:
     """
     完成单日0:00计划与6:00、12:00、18:00滚动调整。
@@ -633,11 +634,25 @@ def run_rolling_day(
         storage：储能参数对象；
         forecast_scale：预报整体缩放系数，无量纲；
         settlement_mode：plan_full或actual_base。
+        decision_price_yuan_per_kwh：用于制定计划和调整策略的价格预测，
+            长度144，元/kWh。若为空，则使用实际价格，仅适用于固定电价或
+            完全信息对照模型。问题4-3必须传入因果价格预测，禁止使用未来价格。
     输出：
         RollingDayResult，包含计划、最终购电、充放电、SOC、
         紧急购电、弃光、费用和四个更新时点的情景汇总。
     """
     _validate_settlement_mode(settlement_mode)
+    actual_price = np.asarray(price_yuan_per_kwh, dtype=float)
+    if actual_price.shape != (T,):
+        raise ValueError("实际电价数组长度必须为144，单位元/kWh。")
+    if decision_price_yuan_per_kwh is None:
+        decision_price = actual_price.copy()
+    else:
+        decision_price = np.asarray(decision_price_yuan_per_kwh, dtype=float)
+        if decision_price.shape != (T,):
+            raise ValueError("决策电价预测数组长度必须为144，单位元/kWh。")
+        if not np.all(np.isfinite(decision_price)) or np.any(decision_price <= 0.0):
+            raise ValueError("决策电价预测必须为有限正值，单位元/kWh。")
     forecast0_kw = expand_hourly_forecast(
         np.asarray(forecast_by_hour[0], dtype=float) * forecast_scale,
         0,
@@ -645,7 +660,7 @@ def run_rolling_day(
     plan = solve_initial_plan(
         load_energy_kwh=load_energy_kwh,
         forecast_pv_energy_kwh=forecast0_kw * DT_H,
-        price_yuan_per_kwh=price_yuan_per_kwh,
+        price_yuan_per_kwh=decision_price,
         storage=storage,
     )
     plan_purchase = plan.planned_purchase_kwh.copy()
@@ -700,7 +715,7 @@ def run_rolling_day(
         adjustment = solve_adjustment_stage(
             load_energy_kwh[start_index:],
             forecast_suffix_kw * DT_H,
-            price_yuan_per_kwh[start_index:],
+            decision_price[start_index:],
             plan_purchase[start_index:],
             storage,
             current_soc,

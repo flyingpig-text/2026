@@ -131,10 +131,41 @@ def build_fixed_price_data(
     return result
 
 
+def build_causal_realtime_price_forecast(
+    price_by_date: dict,
+) -> dict:
+    """
+    只用决策日之前已经实现的附件4价格，构造按时段历史均值预测。
+
+    对第d天第t个10分钟时段：
+        pi_hat(d,t) = mean(pi(1,t), ..., pi(d-1,t))
+
+    预测只使用严格早于第d天的价格，不使用当天未来时段，也不使用未来日期
+    的数据。1月1日没有历史样本，目标结果从2月1日开始，因此不影响输出。
+    """
+    sorted_dates = sorted(price_by_date)
+    cumulative = np.zeros(T, dtype=float)
+    forecast: dict = {}
+    count = 0
+    for current_date in sorted_dates:
+        actual = np.asarray(price_by_date[current_date], dtype=float)
+        if actual.shape != (T,):
+            raise ValueError(f"{current_date}实时电价维度不是144。")
+        if count == 0:
+            # 仅作为内部占位；输出期间从2025-02-01开始，实际不会引用该值。
+            forecast[current_date] = actual.copy()
+        else:
+            forecast[current_date] = cumulative / float(count)
+        cumulative += actual
+        count += 1
+    return forecast
+
+
 def run_volatile_price_sensitivity(
     p2,
     data: pd.DataFrame,
     forecasts: dict,
+    price_forecast_by_date: dict,
     storage,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """对指定日期做预报缩放和电价缩放灵敏度分析。"""
@@ -143,6 +174,10 @@ def run_volatile_price_sensitivity(
     for target in TARGET_DATES:
         day = data[data["日期"].dt.date == target].sort_values("时段序号")
         base_price = day["电价_元每kWh"].to_numpy(dtype=float)
+        decision_price = np.asarray(
+            price_forecast_by_date[target],
+            dtype=float,
+        )
         load = day["小区负载电量_kWh"].to_numpy(dtype=float)
         actual_pv = day["光伏实际电量_kWh"].to_numpy(dtype=float)
         for scale in (0.90, 0.95, 1.00, 1.05, 1.10):
@@ -153,6 +188,7 @@ def run_volatile_price_sensitivity(
                 forecasts[target],
                 storage,
                 forecast_scale=scale,
+                decision_price_yuan_per_kwh=decision_price,
             )
             result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             forecast_rows.append(
@@ -175,6 +211,7 @@ def run_volatile_price_sensitivity(
                 base_price * scale,
                 forecasts[target],
                 storage,
+                decision_price_yuan_per_kwh=decision_price * scale,
             )
             price_result = (
                 rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
@@ -498,6 +535,11 @@ def write_report(
         metric.loc["问题4-3", "紧急购电量_kWh"]
         - metric.loc["问题3", "紧急购电量_kWh"]
     )
+    emergency_43_change_pct = (
+        100.0
+        * emergency_43_change
+        / float(metric.loc["问题3", "紧急购电量_kWh"])
+    )
     lines = [
         "# 问题4结果说明",
         "",
@@ -506,7 +548,9 @@ def write_report(
         "- 附件4电价按对应日期和10分钟时段逐点使用。",
         "- 问题4-2按问题2口径，使用附件2实际光伏制定计划，紧急购电为零。",
         "- 问题4-3按问题3口径，使用附件3预报并允许6:00、12:00、18:00滚动调整。",
-        "- 沿用问题2、问题3既有模型的日循环储能口径，每天0:00和24:00储电量均为6000 kWh。",
+        "- 问题4-3制定计划和调整策略时，不使用未来实时电价；未来时段价格",
+        "  使用附件4中决策日之前历史日期的按时段均值，实际结算才使用当日实时价格。",
+        "- 按题目要求，储能跨日连续，每天0:00和24:00储电量均为6000 kWh。",
         "",
         "## 储能参数",
         "",
@@ -592,7 +636,7 @@ def write_report(
         f"放电量增加 {discharge_42_change:.6f} kWh；电价峰谷价差扩大后，"
         "储能套利空间增加。",
         f"5. 问题4-3紧急购电量比问题3增加 {emergency_43_change:.6f} kWh，"
-        "变化率不足0.1%，说明实时电价主要改变购电价格和充放电时机，"
+        f"变化率 {emergency_43_change_pct:.6f}%，说明实时电价主要改变购电价格和充放电时机，"
         "没有显著扩大预测误差造成的供电缺口。",
         f"6. 问题4-3从仅使用0:00预报到使用18:00前滚动更新，总费用下降 "
         f"{rolling_saving:.6f} 元；6:00、12:00、18:00 的更新均未增加费用，"
@@ -612,6 +656,7 @@ def main() -> None:
     storage = p2.read_storage_parameters(inputs["pdf"])
     forecasts = read_attachment3(inputs["attachment3"])
     price_by_date = read_price_matrix(inputs["attachment4"])
+    causal_price_forecast = build_causal_realtime_price_forecast(price_by_date)
     data = prepare_actual_data(p2, inputs["attachment2"], price_by_date)
     fixed_data = build_fixed_price_data(p2, data, inputs["attachment1"])
 
@@ -643,6 +688,7 @@ def main() -> None:
         data,
         forecasts,
         storage,
+        decision_price_by_date=causal_price_forecast,
     )
     validation43 = validate_result_detail(
         detail43,
@@ -693,6 +739,7 @@ def main() -> None:
         p2,
         data,
         forecasts,
+        causal_price_forecast,
         storage,
     )
     specified_comparison = build_comparison_table(specified42, specified43)
@@ -828,6 +875,16 @@ def main() -> None:
         storage,
     )
     summary = {
+        "问题4-3价格信息口径": {
+            "决策价格": "仅使用附件4中决策日之前已实现数据的按时段历史均值",
+            "结算价格": "使用附件4当日对应时段实际实时电价",
+            "未来实时电价前视": "禁止",
+        },
+        "储能边界": {
+            "跨日连续": True,
+            "每日0:00储电量_kWh": 6000.0,
+            "每日24:00储电量_kWh": 6000.0,
+        },
         "问题4-2": {
             "计划购电量_kWh": float(daily42["计划购电量_kWh"].sum()),
             "紧急购电量_kWh": float(daily42["紧急购电量_kWh"].sum()),
