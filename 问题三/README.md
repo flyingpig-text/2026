@@ -8,7 +8,7 @@
 python "D:\46884\Documents\2026\问题三\problem3_run.py"
 ```
 
-默认使用 5 个历史误差情景、30 天误差回看和 3 天跨日滚动窗口；
+默认使用 5 个历史误差情景、30 天误差回看和 3 天情景生成窗口；
 可通过 `--scenarios`、`--scenario-lookback-days`、`--window-days`
 调整。
 
