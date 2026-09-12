@@ -687,7 +687,7 @@ def plot_scenarios(scenarios: pd.DataFrame, output_path: Path) -> None:
     fig, ax1 = plt.subplots(figsize=(10, 5.5))
     x = np.arange(len(aggregate))
     axis_text_color = "#222222"
-    ax1.bar(x - 0.18, aggregate["总费用_元"], width=0.36, label="总费用", color="#f5a684")
+    ax1.bar(x - 0.18, aggregate["总费用_元"], width=0.2, label="总费用", color="#1f77b4")
     ax1.set_ylabel("总费用 (元)", color=axis_text_color)
     ax1.tick_params(axis="y", labelcolor=axis_text_color)
     ax1.tick_params(axis="x", labelcolor=axis_text_color)
@@ -698,9 +698,9 @@ def plot_scenarios(scenarios: pd.DataFrame, output_path: Path) -> None:
     ax2.bar(
         x + 0.18,
         aggregate["紧急购电量_kWh"],
-        width=0.36,
+        width=0.2,
         label="紧急购电量",
-        color="#fcabed",
+        color="#d62728",
     )
     ax2.set_ylabel("紧急购电量 (kWh)", color=axis_text_color)
     ax2.tick_params(axis="y", labelcolor=axis_text_color)

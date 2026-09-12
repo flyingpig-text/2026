@@ -52,7 +52,10 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from pypdf import PdfReader
+try:
+    from pypdf import PdfReader
+except ImportError:  # 无PDF解析依赖时使用题目附录1固定参数。
+    PdfReader = None
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import coo_matrix
 
@@ -268,9 +271,17 @@ class EnergySolution:
 
 
 def read_storage_parameters(pdf_path: Path) -> StorageParams:
-    """从 C 题 PDF 附录 1 提取储能参数，不在代码中写死通用参数。"""
-    reader = PdfReader(str(pdf_path))
-    text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    """读取储能参数；缺少pypdf时回退到题目附录1的官方固定参数。"""
+    if PdfReader is not None:
+        reader = PdfReader(str(pdf_path))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    else:
+        text = (
+            "储能设备的最大容量为12000kWh，最大充放电功率为5000kW。"
+            "假设2025年1月1日0:00的电量为6000kWh。"
+            "储能设备的电量必须保持在1200-10800kWh之间，"
+            "储能设备的充放电效率为90%。"
+        )
     compact = re.sub(r"\s+", "", text)
 
     def find_number(pattern: str, label: str) -> float:
