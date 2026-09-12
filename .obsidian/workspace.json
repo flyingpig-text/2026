@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "问题四检验.md",
+                "file": "论文/问题四_模型建立与求解_论文稿.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "问题四检验"
+              "title": "问题四_模型建立与求解_论文稿"
             }
           }
         ]
@@ -190,8 +190,8 @@
   },
   "active": "5bf269f964764f3b",
   "lastOpenFiles": [
-    "数据溯源.md",
     "问题四检验.md",
+    "数据溯源.md",
     "问题二/问题二_题目关键约束与输出要求.md",
     "问题二/问题二_模型算法推导与检验.md",
     "问题三/问题三_关键约束与输出要求.md",
