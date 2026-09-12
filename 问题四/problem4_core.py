@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 import numpy as np
 import pandas as pd
@@ -21,19 +21,24 @@ from problem3_algorithm import (
     AdjustmentResult,
     InitialPlanResult,
     RollingDayResult,
+    execute_block_with_future_value,
     run_rolling_day,
     solve_adjustment_stage,
-    solve_initial_plan,
+    solve_flexible_purchase_stage,
+    settle_actual_dispatch,
 )
 from problem3_core import (
     OUTPUT_END,
     OUTPUT_START,
     dataframe_row_for_day,
 )
+from problem3_scenarios import build_day_scenario_windows
 
 
 PERIODS_PER_DAY = 144
 DT_H = 10.0 / 60.0
+DEFAULT_SCENARIO_COUNT = 5
+DEFAULT_SCENARIO_LOOKBACK_DAYS = 30
 
 
 class StorageLike(Protocol):
@@ -96,45 +101,190 @@ def build_causal_price_forecast(
     return forecast
 
 
+def terminal_soc_value_yuan_per_kwh(
+    expected_price_yuan_per_kwh: np.ndarray,
+    storage: StorageLike,
+) -> float:
+    """按推导文档的日末库存价值口径，给出非负的终端储能单位价值。"""
+    price = np.asarray(expected_price_yuan_per_kwh, dtype=float)
+    if price.shape != (PERIODS_PER_DAY,) or not np.all(np.isfinite(price)):
+        raise ValueError("期望电价必须为长度144的有限数组。")
+    if np.any(price <= 0.0):
+        raise ValueError("期望电价必须为正值。")
+    early_mean = float(np.mean(price[:30]))
+    return early_mean / float(storage.efficiency)
+
+
+def build_problem4_scenario_windows(
+    data: pd.DataFrame,
+    forecast_by_date: Mapping[date, Mapping[int, np.ndarray]],
+    current_date: date,
+    price_by_date: Mapping[date, np.ndarray],
+    expected_price_yuan_per_kwh: np.ndarray,
+    fallback_load_profile_kwh: np.ndarray,
+    *,
+    scenario_count: int = DEFAULT_SCENARIO_COUNT,
+    lookback_days: int = DEFAULT_SCENARIO_LOOKBACK_DAYS,
+    forecast_scale: float = 1.0,
+) -> dict[int, dict[str, Any]]:
+    """
+    构造问题四的联合历史情景窗口。
+
+    负荷和光伏误差仍由问题三的因果情景生成器提供；电价情景按同一历史
+    日期配对，避免独立抽样破坏负荷、光伏和价格的相关性。6:00、12:00、
+    18:00 的价格情景使用“已观察价格 + 历史同日同时段增量”，因此不会
+    使用当天未来实际价格。
+    """
+    windows = build_day_scenario_windows(
+        data,
+        forecast_by_date,
+        current_date,
+        np.asarray(expected_price_yuan_per_kwh, dtype=float),
+        fallback_load_profile_kwh,
+        scenario_count=scenario_count,
+        lookback_days=lookback_days,
+        window_days=1,
+        forecast_scale=forecast_scale,
+    )
+    actual_price = data[
+        data["日期"].dt.date == current_date
+    ].sort_values("时段序号")["电价_元每kWh"].to_numpy(dtype=float)
+    if actual_price.shape != (PERIODS_PER_DAY,):
+        raise ValueError(f"{current_date}实际电价不是144个时段。")
+
+    for start_hour, window in windows.items():
+        load_scenarios = np.asarray(window["load_kwh"], dtype=float)
+        scenario_count_window = load_scenarios.shape[0]
+        horizon = load_scenarios.shape[1]
+        current_intervals = int(window["current_intervals"])
+        selected_dates = tuple(window.get("selected_error_dates", ()))
+        if not selected_dates:
+            # 1月1日没有历史日期可用，只作为内部预热占位；正式输出从2月1日开始。
+            selected_dates = (current_date,) * scenario_count_window
+        if len(selected_dates) != scenario_count_window:
+            selected_dates = tuple(
+                selected_dates[index % len(selected_dates)]
+                for index in range(scenario_count_window)
+            )
+
+        start_index = start_hour * 6
+        scenario_prices = np.empty(
+            (scenario_count_window, horizon),
+            dtype=float,
+        )
+        for scenario_index, history_date in enumerate(selected_dates):
+            history_price = np.asarray(
+                price_by_date[history_date],
+                dtype=float,
+            )
+            if history_price.shape != (PERIODS_PER_DAY,):
+                raise ValueError("历史电价必须为144个时段。")
+            if start_hour == 0:
+                current_curve = history_price[:current_intervals].copy()
+            else:
+                reference_actual = float(actual_price[start_index - 1])
+                reference_history = float(history_price[start_index - 1])
+                current_curve = (
+                    reference_actual
+                    + history_price[start_index:]
+                    - reference_history
+                )
+            current_curve = np.maximum(current_curve, 1e-6)
+            future_curve = history_price[:PERIODS_PER_DAY]
+            parts = [current_curve]
+            remaining = horizon - current_intervals
+            if remaining > 0:
+                if remaining % PERIODS_PER_DAY != 0:
+                    raise ValueError("情景窗口的后续长度不是完整天数。")
+                parts.extend(
+                    [future_curve] * (remaining // PERIODS_PER_DAY)
+                )
+            scenario_prices[scenario_index] = np.concatenate(parts)
+
+        probabilities = np.asarray(
+            window["probabilities"],
+            dtype=float,
+        )
+        window["price_scenarios_yuan_per_kwh"] = scenario_prices
+        window["price_yuan_per_kwh"] = probabilities @ scenario_prices
+    return windows
+
+
 def solve_problem42_day(
     load_energy_kwh: np.ndarray,
     pv_energy_kwh: np.ndarray,
-    price_yuan_per_kwh: np.ndarray,
+    actual_price_yuan_per_kwh: np.ndarray,
+    scenario_window: Mapping[str, Any],
     storage: StorageLike,
     initial_soc_kwh: float | None = None,
-    final_soc_kwh: float | None = None,
+    terminal_value_yuan_per_kwh: float = 0.0,
 ) -> InitialPlanResult:
-    """
-    求解波动电价下问题4-2的单日确定性 MILP。
-
-    输入：
-        load_energy_kwh：144维小区负荷电量，单位kWh。
-        pv_energy_kwh：144维光伏实际发电量，单位kWh。
-        price_yuan_per_kwh：144维当日实时电价，单位元/kWh。
-        storage：储能参数对象，需提供容量、功率、SOC上下限和效率。
-        initial_soc_kwh：单日0:00储电量，单位kWh；默认6000 kWh。
-        final_soc_kwh：单日24:00储电量，单位kWh；默认与初始值相同。
-
-    输出：
-        InitialPlanResult，包含计划购电、紧急购电、充放电、弃光、
-        SOC轨迹以及计划费用、紧急费用和总费用。
-
-    核心约束：
-        x_t+e_t+pv_t+d_t=load_t+c_t+s_t；
-        E_t=E_(t-1)+eta*c_t-d_t/eta；
-        E_0=E_144=6000 kWh。
-    """
+    """求解波动电价下问题 4-2 的随机计划与实时储能执行。"""
     if initial_soc_kwh is None:
         initial_soc_kwh = float(storage.initial_kwh)
-    if final_soc_kwh is None:
-        final_soc_kwh = float(initial_soc_kwh)
-    return solve_initial_plan(
-        load_energy_kwh=np.asarray(load_energy_kwh, dtype=float),
-        forecast_pv_energy_kwh=np.asarray(pv_energy_kwh, dtype=float),
-        price_yuan_per_kwh=np.asarray(price_yuan_per_kwh, dtype=float),
-        storage=storage,
-        initial_soc_kwh=initial_soc_kwh,
-        final_soc_kwh=final_soc_kwh,
+    load_actual = np.asarray(load_energy_kwh, dtype=float)
+    pv_actual = np.asarray(pv_energy_kwh, dtype=float)
+    actual_price = np.asarray(actual_price_yuan_per_kwh, dtype=float)
+    load_scenarios = np.asarray(scenario_window["load_kwh"], dtype=float)
+    pv_scenarios = np.asarray(scenario_window["pv_kwh"], dtype=float)
+    probabilities = np.asarray(
+        scenario_window["probabilities"],
+        dtype=float,
+    )
+    expected_price = np.asarray(
+        scenario_window["price_yuan_per_kwh"],
+        dtype=float,
+    )
+    scenario_prices = np.asarray(
+        scenario_window["price_scenarios_yuan_per_kwh"],
+        dtype=float,
+    )
+    plan = solve_flexible_purchase_stage(
+        load_scenarios,
+        pv_scenarios,
+        probabilities,
+        expected_price,
+        storage,
+        float(initial_soc_kwh),
+        terminal_soc_value_yuan_per_kwh=terminal_value_yuan_per_kwh,
+        scenario_price_yuan_per_kwh=scenario_prices,
+    )
+    plan_purchase = plan["purchase_kwh"]
+    execution = execute_block_with_future_value(
+        load_actual,
+        pv_actual,
+        plan_purchase,
+        load_scenarios,
+        pv_scenarios,
+        probabilities,
+        actual_price,
+        storage,
+        initial_soc_kwh=float(initial_soc_kwh),
+        terminal_soc_value_yuan_per_kwh=terminal_value_yuan_per_kwh,
+        scenario_price_yuan_per_kwh=scenario_prices,
+    )
+    settlement = settle_actual_dispatch(
+        plan_purchase,
+        plan_purchase,
+        execution["charge_kwh"],
+        execution["discharge_kwh"],
+        load_actual,
+        pv_actual,
+        actual_price,
+        storage,
+        float(initial_soc_kwh),
+    )
+    return InitialPlanResult(
+        planned_purchase_kwh=plan_purchase,
+        emergency_purchase_kwh=settlement.emergency_purchase_kwh,
+        charge_kwh=settlement.charge_kwh,
+        discharge_kwh=settlement.discharge_kwh,
+        curtail_kwh=settlement.actual_curtail_kwh,
+        soc_kwh=settlement.soc_kwh,
+        planned_cost_yuan=float(settlement.plan_cost_kwh_yuan.sum()),
+        emergency_cost_yuan=float(settlement.emergency_cost_yuan.sum()),
+        total_cost_yuan=float(settlement.total_cost_yuan),
+        solver_status=str(plan["solver_status"]),
     )
 
 
@@ -188,6 +338,7 @@ def solve_problem43_day(
             decision_price_yuan_per_kwh,
             dtype=float,
         ),
+        report_update_scenarios=False,
     )
 
 
@@ -241,15 +392,26 @@ def solve_adjustment(
 
 def solve_problem42_year(
     data: pd.DataFrame,
+    forecast_by_date: Mapping[date, Mapping[int, np.ndarray]],
+    price_by_date: Mapping[date, np.ndarray],
+    decision_price_by_date: Mapping[date, np.ndarray],
     storage: StorageLike,
+    fallback_load_profile_kwh: np.ndarray,
+    *,
+    scenario_count: int = DEFAULT_SCENARIO_COUNT,
+    lookback_days: int = DEFAULT_SCENARIO_LOOKBACK_DAYS,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    完成问题4-2的全年逐日求解。
+    从2025-01-01开始连续求解问题4-2，仅输出2月1日至12月31日。
 
     输入：
         data：附件2与附件4合并后的逐10分钟长表，至少包含日期、时段序号、
             小区负载电量_kWh、光伏实际电量_kWh和电价_元每kWh。
+        forecast_by_date：附件3预报，用于构造历史联合情景。
+        price_by_date：附件4实际电价。
+        decision_price_by_date：严格因果的实时电价基线预测。
         storage：储能参数对象。
+        fallback_load_profile_kwh：历史不足时的负荷基准，单位kWh。
 
     输出：
         detail：逐10分钟调度明细，日期为2025-02-01至2025-12-31。
@@ -257,26 +419,45 @@ def solve_problem42_year(
     """
     detail_rows: list[dict[str, object]] = []
     daily_rows: list[dict[str, object]] = []
-    dates = sorted(
-        current_date
-        for current_date in data["日期"].dt.date.unique()
-        if OUTPUT_START <= current_date <= OUTPUT_END
-    )
-    for current_date in dates:
+    all_dates = sorted(data["日期"].dt.date.unique())
+    current_soc_kwh = float(storage.initial_kwh)
+    for current_date in all_dates:
         day = data[data["日期"].dt.date == current_date].sort_values(
             "时段序号"
         )
         if len(day) != PERIODS_PER_DAY:
             raise ValueError(f"{current_date}缺少144个10分钟时段。")
+        windows = build_problem4_scenario_windows(
+            data,
+            forecast_by_date,
+            current_date,
+            price_by_date,
+            decision_price_by_date[current_date],
+            fallback_load_profile_kwh,
+            scenario_count=scenario_count,
+            lookback_days=lookback_days,
+        )
+        expected_price = np.asarray(
+            windows[0]["price_yuan_per_kwh"],
+            dtype=float,
+        )
+        terminal_value = terminal_soc_value_yuan_per_kwh(
+            expected_price,
+            storage,
+        )
+        actual_price = day["电价_元每kWh"].to_numpy(dtype=float)
         dispatch = solve_problem42_day(
             load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
             pv_energy_kwh=day["光伏实际电量_kWh"].to_numpy(dtype=float),
-            price_yuan_per_kwh=day["电价_元每kWh"].to_numpy(dtype=float),
+            actual_price_yuan_per_kwh=actual_price,
+            scenario_window=windows[0],
             storage=storage,
-            initial_soc_kwh=float(storage.initial_kwh),
-            final_soc_kwh=float(storage.initial_kwh),
+            initial_soc_kwh=current_soc_kwh,
+            terminal_value_yuan_per_kwh=terminal_value,
         )
-        price = day["电价_元每kWh"].to_numpy(dtype=float)
+        current_soc_kwh = float(dispatch.soc_kwh[-1])
+        if not (OUTPUT_START <= current_date <= OUTPUT_END):
+            continue
         result_dict = {
             "plan_purchase_kwh": dispatch.planned_purchase_kwh,
             "adjusted_purchase_kwh": dispatch.planned_purchase_kwh,
@@ -285,23 +466,53 @@ def solve_problem42_year(
             "soc_kwh": dispatch.soc_kwh,
             "emergency_purchase_kwh": dispatch.emergency_purchase_kwh,
             "actual_curtail_kwh": dispatch.curtail_kwh,
+            "decision_load_kwh": np.average(
+                np.asarray(windows[0]["load_kwh"], dtype=float),
+                axis=0,
+                weights=np.asarray(
+                    windows[0]["probabilities"],
+                    dtype=float,
+                ),
+            ),
             "forecast0_kw": (
-                day["光伏实际电量_kWh"].to_numpy(dtype=float) / DT_H
+                np.average(
+                    np.asarray(windows[0]["pv_kwh"], dtype=float),
+                    axis=0,
+                    weights=np.asarray(
+                        windows[0]["probabilities"],
+                        dtype=float,
+                    ),
+                )
+                / DT_H
             ),
             "latest_forecast_kw": (
-                day["光伏实际电量_kWh"].to_numpy(dtype=float) / DT_H
+                np.average(
+                    np.asarray(windows[0]["pv_kwh"], dtype=float),
+                    axis=0,
+                    weights=np.asarray(
+                        windows[0]["probabilities"],
+                        dtype=float,
+                    ),
+                )
+                / DT_H
             ),
             "up_kwh": np.zeros(PERIODS_PER_DAY, dtype=float),
             "down_kwh": np.zeros(PERIODS_PER_DAY, dtype=float),
-            "plan_cost_kwh_yuan": price * dispatch.planned_purchase_kwh,
+            "plan_cost_kwh_yuan": (
+                actual_price * dispatch.planned_purchase_kwh
+            ),
             "adjustment_cost_yuan": np.zeros(
                 PERIODS_PER_DAY,
                 dtype=float,
             ),
             "emergency_cost_yuan": (
-                5.0 * price * dispatch.emergency_purchase_kwh
+                5.0 * actual_price * dispatch.emergency_purchase_kwh
             ),
-            "total_cost_yuan": dispatch.total_cost_yuan,
+            "total_cost_yuan": float(
+                np.sum(actual_price * dispatch.planned_purchase_kwh)
+                + 5.0
+                * np.sum(actual_price * dispatch.emergency_purchase_kwh)
+            ),
         }
         rows, daily = dataframe_row_for_day(
             current_date,
@@ -322,17 +533,25 @@ def solve_problem43_year(
     data: pd.DataFrame,
     forecast_by_date: Mapping[date, Mapping[int, np.ndarray]],
     storage: StorageLike,
+    price_by_date: Mapping[date, np.ndarray],
     decision_price_by_date: Mapping[date, np.ndarray] | None = None,
+    fallback_load_profile_kwh: np.ndarray | None = None,
+    *,
+    scenario_count: int = DEFAULT_SCENARIO_COUNT,
+    lookback_days: int = DEFAULT_SCENARIO_LOOKBACK_DAYS,
+    collect_update_scenarios: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    完成问题4-3的全年逐日滚动求解。
+    从2025-01-01开始连续求解问题4-3，仅输出2月1日至12月31日。
 
     输入：
         data：附件2与附件4合并后的逐10分钟长表。
         forecast_by_date：附件3预报，日期 -> {0,6,12,18 -> 24维kW}。
         storage：储能参数对象。
+        price_by_date：附件4实际电价。
         decision_price_by_date：决策价格预测，日期 -> 144维元/kWh。
             为空时使用当日实际价格，仅适用于固定电价对照。
+        fallback_load_profile_kwh：历史不足时的负荷基准，单位kWh。
 
     输出：
         detail：逐10分钟最终调度明细。
@@ -342,12 +561,16 @@ def solve_problem43_year(
     detail_rows: list[dict[str, object]] = []
     daily_rows: list[dict[str, object]] = []
     scenario_rows: list[dict[str, object]] = []
-    dates = sorted(
-        current_date
-        for current_date in data["日期"].dt.date.unique()
-        if OUTPUT_START <= current_date <= OUTPUT_END
-    )
-    for current_date in dates:
+    if fallback_load_profile_kwh is None:
+        first_day = data[
+            data["日期"].dt.date == min(data["日期"].dt.date.unique())
+        ].sort_values("时段序号")
+        fallback_load_profile_kwh = first_day[
+            "小区负载电量_kWh"
+        ].to_numpy(dtype=float)
+    all_dates = sorted(data["日期"].dt.date.unique())
+    current_soc_kwh = float(storage.initial_kwh)
+    for current_date in all_dates:
         day = data[data["日期"].dt.date == current_date].sort_values(
             "时段序号"
         )
@@ -359,17 +582,49 @@ def solve_problem43_year(
             if decision_price_by_date is not None
             else actual_price
         )
-        rolling = solve_problem43_day(
+        windows = build_problem4_scenario_windows(
+            data,
+            forecast_by_date,
+            current_date,
+            price_by_date,
+            decision_price,
+            fallback_load_profile_kwh,
+            scenario_count=scenario_count,
+            lookback_days=lookback_days,
+        )
+        expected_price = np.asarray(
+            windows[0]["price_yuan_per_kwh"],
+            dtype=float,
+        )
+        terminal_value = terminal_soc_value_yuan_per_kwh(
+            expected_price,
+            storage,
+        )
+        decision_load = np.average(
+            np.asarray(windows[0]["load_kwh"], dtype=float),
+            axis=0,
+            weights=np.asarray(windows[0]["probabilities"], dtype=float),
+        )
+        rolling = run_rolling_day(
             load_energy_kwh=day["小区负载电量_kWh"].to_numpy(dtype=float),
             actual_pv_energy_kwh=day["光伏实际电量_kWh"].to_numpy(
                 dtype=float
             ),
-            actual_price_yuan_per_kwh=actual_price,
-            decision_price_yuan_per_kwh=decision_price,
+            price_yuan_per_kwh=actual_price,
             forecast_by_hour=forecast_by_date[current_date],
             storage=storage,
+            initial_soc_kwh=current_soc_kwh,
+            decision_price_yuan_per_kwh=expected_price,
+            forecast_load_energy_kwh=decision_load,
+            scenario_windows_by_hour=windows,
+            live_storage_execution=True,
+            terminal_soc_value_yuan_per_kwh=terminal_value,
+            report_update_scenarios=collect_update_scenarios,
         )
         result = rolling.as_dict()
+        current_soc_kwh = float(result["soc_kwh"][-1])
+        if not (OUTPUT_START <= current_date <= OUTPUT_END):
+            continue
         rows, daily = dataframe_row_for_day(current_date, data, result)
         detail_rows.extend(rows)
         daily_rows.append(daily)
@@ -381,5 +636,20 @@ def solve_problem43_year(
     scenarios = pd.DataFrame(scenario_rows)
     detail["日期"] = pd.to_datetime(detail["日期"])
     daily["日期"] = pd.to_datetime(daily["日期"])
-    scenarios["日期"] = pd.to_datetime(scenarios["日期"])
+    if not scenarios.empty:
+        scenarios["日期"] = pd.to_datetime(scenarios["日期"])
+    else:
+        scenarios = pd.DataFrame(
+            columns=[
+                "日期",
+                "情景",
+                "计划购电量_kWh",
+                "调整购电量_kWh",
+                "紧急购电量_kWh",
+                "计划购电费_元",
+                "调整费用_元",
+                "紧急购电费_元",
+                "总费用_元",
+            ]
+        )
     return detail, daily, scenarios

@@ -1251,13 +1251,15 @@ def validate_result_detail(
                 + day["光伏实际_kW"].to_numpy(dtype=float) * DT_H
                 + discharge
             )
-            # 问题2口径允许实际光伏过剩时弃光，因此平衡残差必须扣除弃光量。
+            # 问题2、问题4-2允许应急购电，也必须允许实际光伏过剩时弃光。
+            emergency = day["紧急购电量_kWh"].to_numpy(dtype=float)
             curtail = day["实际弃光量_kWh"].to_numpy(dtype=float)
-            balance = available - required - curtail
+            balance = available + emergency - required - curtail
             max_balance_error = max(
                 max_balance_error,
                 float(np.max(np.abs(balance))),
             )
+            total_emergency += float(emergency.sum())
         if previous_final_soc is not None:
             max_cross_day_soc_error = max(
                 max_cross_day_soc_error,

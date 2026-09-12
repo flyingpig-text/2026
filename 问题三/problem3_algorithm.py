@@ -870,6 +870,7 @@ def solve_flexible_purchase_stage(
     plan_purchase_kwh: np.ndarray | None = None,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     time_limit_s: float = 60.0,
+    scenario_price_yuan_per_kwh: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """
     求解“购电量共同决策、充放电按情景实时追索”的随机LP。
@@ -877,6 +878,11 @@ def solve_flexible_purchase_stage(
     计划阶段令plan_purchase_kwh=None，只确定计划购电g。
     预报更新阶段传入对应时段的g，并把相对g的偏差纳入调整费用。
     储能充放电量在每个情景内独立，代表实际运行时可按当时真实数据调整。
+
+    scenario_price_yuan_per_kwh：
+        可选，形状为(情景数,时段数)。给定后，计划购电量按情景期望价格
+        计价，紧急购电按各情景自己的价格计价；未给定时沿用单一价格
+        向量，保持问题三原有调用完全兼容。
     """
     load = np.asarray(load_scenarios_kwh, dtype=float)
     pv = np.asarray(pv_scenarios_kwh, dtype=float)
@@ -889,6 +895,19 @@ def solve_flexible_purchase_stage(
         raise ValueError("情景概率长度必须等于情景数量。")
     if price.shape != (horizon,):
         raise ValueError("电价长度必须等于优化时段数。")
+    scenario_price: np.ndarray | None = None
+    if scenario_price_yuan_per_kwh is not None:
+        scenario_price = np.asarray(
+            scenario_price_yuan_per_kwh,
+            dtype=float,
+        )
+        if scenario_price.shape != (scenario_count, horizon):
+            raise ValueError("情景电价形状必须为(情景数,时段数)。")
+        if (
+            not np.all(np.isfinite(scenario_price))
+            or np.any(scenario_price <= 0.0)
+        ):
+            raise ValueError("情景电价必须为有限正值。")
     if abs(float(probabilities.sum()) - 1.0) > 1e-10:
         raise ValueError("情景概率之和必须为1。")
     if not np.all(np.isfinite(load)) or np.any(load < 0.0):
@@ -930,9 +949,14 @@ def solve_flexible_purchase_stage(
         objective[down_slice] = DOWN_ADJUSTMENT_MULTIPLIER * price
     else:
         objective[q_slice] = price
+    emergency_price = (
+        scenario_price.reshape(-1)
+        if scenario_price is not None
+        else np.tile(price, scenario_count)
+    )
     objective[emergency_start:curtail_start] = (
         EMERGENCY_MULTIPLIER
-        * np.tile(price, scenario_count)
+        * emergency_price
         * np.repeat(probabilities, horizon)
     )
     # 消除LP退化造成的无意义同时充放电。
@@ -1066,6 +1090,7 @@ def _build_future_value_tables(
     *,
     terminal_soc_value_yuan_per_kwh: float,
     soc_grid_points: int = 61,
+    scenario_price_yuan_per_kwh: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """构造实时执行所用的平均未来费用函数。"""
     load = np.asarray(load_scenarios_kwh, dtype=float)
@@ -1080,6 +1105,19 @@ def _build_future_value_tables(
         raise ValueError("未来价值情景概率维度不合法。")
     if purchase.shape != (horizon,) or price.shape != (horizon,):
         raise ValueError("未来价值购电量或电价维度不合法。")
+    scenario_price: np.ndarray | None = None
+    if scenario_price_yuan_per_kwh is not None:
+        scenario_price = np.asarray(
+            scenario_price_yuan_per_kwh,
+            dtype=float,
+        )
+        if scenario_price.shape != (scenario_count, horizon):
+            raise ValueError("未来价值情景电价维度不合法。")
+        if (
+            not np.all(np.isfinite(scenario_price))
+            or np.any(scenario_price <= 0.0)
+        ):
+            raise ValueError("未来价值情景电价必须为有限正值。")
     if soc_grid_points < 2:
         raise ValueError("SOC网格点数至少为2。")
 
@@ -1126,9 +1164,14 @@ def _build_future_value_tables(
                 continue
 
             max_discharge = min(residual_value, max_interval_energy)
+            scenario_price_value = (
+                float(scenario_price[scenario, period])
+                if scenario_price is not None
+                else float(price[period])
+            )
             linear_cost = (
                 EMERGENCY_MULTIPLIER
-                * price[period]
+                * scenario_price_value
                 * storage.efficiency
             )
             candidate_values = next_value + linear_cost * soc_grid
@@ -1158,7 +1201,7 @@ def _build_future_value_tables(
                     queue.popleft()
                 current_value[state_index] = (
                     EMERGENCY_MULTIPLIER
-                    * price[period]
+                    * scenario_price_value
                     * residual_value
                     + candidate_values[queue[0]]
                     - linear_cost * current_soc
@@ -1185,6 +1228,7 @@ def execute_block_with_future_value(
     initial_soc_kwh: float,
     terminal_soc_value_yuan_per_kwh: float,
     soc_grid_points: int = 61,
+    scenario_price_yuan_per_kwh: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """按真实数据逐10分钟执行储能，未来价值来自当前可用情景。"""
     actual_load = np.asarray(actual_load_kwh, dtype=float)
@@ -1208,6 +1252,7 @@ def execute_block_with_future_value(
         storage,
         terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
         soc_grid_points=soc_grid_points,
+        scenario_price_yuan_per_kwh=scenario_price_yuan_per_kwh,
     )
     max_interval_energy = storage.power_kw * DT_H
     charge = np.zeros(horizon, dtype=float)
@@ -1298,6 +1343,7 @@ def _run_live_storage_day(
     decision_load_kwh: np.ndarray,
     terminal_soc_value_yuan_per_kwh: float,
     scenario_time_limit_s: float,
+    report_update_scenarios: bool = True,
 ) -> RollingDayResult:
     """0:00固定g，预报点更新q，充放电按实际数据实时滚动执行。"""
     forecast0_kw = expand_hourly_forecast(
@@ -1314,6 +1360,9 @@ def _run_live_storage_day(
         initial_soc_kwh,
         terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
         time_limit_s=scenario_time_limit_s,
+        scenario_price_yuan_per_kwh=plan_window.get(
+            "price_scenarios_yuan_per_kwh"
+        ),
     )
     plan_purchase = plan["purchase_kwh"][:T].copy()
     block_hours = (0, *UPDATE_HOURS)
@@ -1335,6 +1384,14 @@ def _run_live_storage_day(
             block_load = window["load_kwh"][:, :block_length]
             block_pv = window["pv_kwh"][:, :block_length]
             block_price = window["price_yuan_per_kwh"][:block_length]
+            block_scenario_price = window.get(
+                "price_scenarios_yuan_per_kwh"
+            )
+            if block_scenario_price is not None:
+                block_scenario_price = np.asarray(
+                    block_scenario_price,
+                    dtype=float,
+                )[:, :block_length]
             block_plan = plan_purchase[
                 start_index : start_index + block_length
             ]
@@ -1352,6 +1409,7 @@ def _run_live_storage_day(
                         terminal_soc_value_yuan_per_kwh
                     ),
                     time_limit_s=scenario_time_limit_s,
+                    scenario_price_yuan_per_kwh=block_scenario_price,
                 )
                 adjusted[
                     start_index : start_index + block_length
@@ -1374,6 +1432,7 @@ def _run_live_storage_day(
                 terminal_soc_value_yuan_per_kwh=(
                     terminal_soc_value_yuan_per_kwh
                 ),
+                scenario_price_yuan_per_kwh=block_scenario_price,
             )
             slc = slice(start_index, start_index + block_length)
             charge[slc] = execution["charge_kwh"]
@@ -1407,42 +1466,43 @@ def _run_live_storage_day(
         ("更新至12:00", (6, 12)),
         ("更新至18:00", (6, 12, 18)),
     )
-    for label, update_hours in scenario_specs:
-        simulated = simulate(update_hours)
-        settlement = settle_actual_dispatch(
-            plan_purchase,
-            simulated["adjusted_purchase_kwh"],
-            simulated["charge_kwh"],
-            simulated["discharge_kwh"],
-            actual_load_kwh,
-            actual_pv_energy_kwh,
-            price_yuan_per_kwh,
-            storage,
-            initial_soc_kwh,
-            settlement_mode=settlement_mode,
-        )
-        scenario_rows.append(
-            {
-                "情景": label,
-                "计划购电量_kWh": float(plan_purchase.sum()),
-                "调整购电量_kWh": float(
-                    settlement.adjusted_purchase_kwh.sum()
-                ),
-                "紧急购电量_kWh": float(
-                    settlement.emergency_purchase_kwh.sum()
-                ),
-                "计划购电费_元": float(
-                    settlement.plan_cost_kwh_yuan.sum()
-                ),
-                "调整费用_元": float(
-                    settlement.adjustment_cost_yuan.sum()
-                ),
-                "紧急购电费_元": float(
-                    settlement.emergency_cost_yuan.sum()
-                ),
-                "总费用_元": float(settlement.total_cost_yuan),
-            }
-        )
+    if report_update_scenarios:
+        for label, update_hours in scenario_specs:
+            simulated = simulate(update_hours)
+            settlement = settle_actual_dispatch(
+                plan_purchase,
+                simulated["adjusted_purchase_kwh"],
+                simulated["charge_kwh"],
+                simulated["discharge_kwh"],
+                actual_load_kwh,
+                actual_pv_energy_kwh,
+                price_yuan_per_kwh,
+                storage,
+                initial_soc_kwh,
+                settlement_mode=settlement_mode,
+            )
+            scenario_rows.append(
+                {
+                    "情景": label,
+                    "计划购电量_kWh": float(plan_purchase.sum()),
+                    "调整购电量_kWh": float(
+                        settlement.adjusted_purchase_kwh.sum()
+                    ),
+                    "紧急购电量_kWh": float(
+                        settlement.emergency_purchase_kwh.sum()
+                    ),
+                    "计划购电费_元": float(
+                        settlement.plan_cost_kwh_yuan.sum()
+                    ),
+                    "调整费用_元": float(
+                        settlement.adjustment_cost_yuan.sum()
+                    ),
+                    "紧急购电费_元": float(
+                        settlement.emergency_cost_yuan.sum()
+                    ),
+                    "总费用_元": float(settlement.total_cost_yuan),
+                }
+            )
 
     final_simulation = simulate(tuple(UPDATE_HOURS))
     final = settle_actual_dispatch(
@@ -1493,6 +1553,7 @@ def run_rolling_day(
     live_storage_execution: bool = False,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     scenario_time_limit_s: float = 60.0,
+    report_update_scenarios: bool = True,
 ) -> RollingDayResult:
     """
     完成单日0:00计划与6:00、12:00、18:00滚动调整。
@@ -1565,6 +1626,7 @@ def run_rolling_day(
             decision_load,
             terminal_soc_value_yuan_per_kwh,
             scenario_time_limit_s,
+            report_update_scenarios,
         )
     forecast0_kw = expand_hourly_forecast(
         np.asarray(forecast_by_hour[0], dtype=float) * forecast_scale,

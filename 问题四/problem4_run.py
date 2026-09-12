@@ -31,6 +31,7 @@ from problem3_core import (  # noqa: E402
     locate_inputs,
     prepare_actual_data,
     print_quantity_checks,
+    read_attachment1_load_energy,
     read_attachment3,
     read_price_matrix,
     summarize_specified_dates,
@@ -222,7 +223,7 @@ def build_regime_comparison_table(
         {
             "模型": "问题2",
             "电价情景": "附件1固定日内电价",
-            "预测信息": "实际负荷、实际光伏",
+            "预测信息": "历史联合情景",
             "计划购电量_kWh": float(daily2_fixed["计划购电量_kWh"].sum()),
             "调整购电量_kWh": np.nan,
             "紧急购电量_kWh": float(daily2_fixed["紧急购电量_kWh"].sum()),
@@ -231,7 +232,7 @@ def build_regime_comparison_table(
         {
             "模型": "问题4-2",
             "电价情景": "附件4实时波动电价",
-            "预测信息": "实际负荷、实际光伏",
+            "预测信息": "历史联合情景",
             "计划购电量_kWh": float(daily42["计划购电量_kWh"].sum()),
             "调整购电量_kWh": np.nan,
             "紧急购电量_kWh": float(daily42["紧急购电量_kWh"].sum()),
@@ -240,7 +241,7 @@ def build_regime_comparison_table(
         {
             "模型": "问题3",
             "电价情景": "附件1固定日内电价",
-            "预测信息": "附件3滚动光伏预报",
+            "预测信息": "附件3预报+联合情景",
             "计划购电量_kWh": float(daily3_fixed["计划购电量_kWh"].sum()),
             "调整购电量_kWh": float(daily3_fixed["调整购电量_kWh"].sum()),
             "紧急购电量_kWh": float(daily3_fixed["紧急购电量_kWh"].sum()),
@@ -249,7 +250,7 @@ def build_regime_comparison_table(
         {
             "模型": "问题4-3",
             "电价情景": "附件4实时波动电价",
-            "预测信息": "附件3滚动光伏预报",
+            "预测信息": "附件3预报+联合情景",
             "计划购电量_kWh": float(daily43["计划购电量_kWh"].sum()),
             "调整购电量_kWh": float(daily43["调整购电量_kWh"].sum()),
             "紧急购电量_kWh": float(daily43["紧急购电量_kWh"].sum()),
@@ -491,10 +492,6 @@ def write_report(
     delta_43_pct = float(
         row.loc["问题4-3", "相对固定电价费用变化_百分比"]
     )
-    rolling_saving = float(
-        scenario_summary.iloc[0]["总费用_元"]
-        - scenario_summary.iloc[-1]["总费用_元"]
-    )
     charge_42_change = float(
         metric.loc["问题4-2", "充电量_kWh"]
         - metric.loc["问题2", "充电量_kWh"]
@@ -518,11 +515,12 @@ def write_report(
         "## 模型口径",
         "",
         "- 附件4电价按对应日期和10分钟时段逐点使用。",
-        "- 问题4-2按问题2口径，使用附件2实际光伏制定计划，紧急购电为零。",
+        "- 问题4-2以历史联合情景制定计划购电量，实际运行时逐10分钟观测实时电价并执行储能。",
         "- 问题4-3按问题3口径，使用附件3预报并允许6:00、12:00、18:00滚动调整。",
         "- 问题4-3制定计划和调整策略时，不使用未来实时电价；未来时段价格",
-        "  使用附件4中决策日之前历史日期的按时段均值，实际结算才使用当日实时价格。",
-        "- 按题目要求，储能跨日连续，每天0:00和24:00储电量均为6000 kWh。",
+        "  使用已观察价格加历史同日价格增量构造情景，实际结算才使用当日实时价格。",
+        "- 储能从2025年1月1日0:00的6000 kWh开始跨日连续运行；1月用于预热，",
+        "  正式输出为2025年2月1日至12月31日。",
         "",
         "## 储能参数",
         "",
@@ -569,12 +567,6 @@ def write_report(
         csv_block(specified43),
         "```",
         "",
-        "## 问题4-3预报更新时点比较",
-        "",
-        "```text",
-        csv_block(scenario_summary),
-        "```",
-        "",
         "## 问题4-3预报缩放灵敏度",
         "",
         "```text",
@@ -604,15 +596,14 @@ def write_report(
         f"高价区间放电量占比 "
         f"{float(metric.loc['问题4-2', '高价放电占比_百分比']):.6f}%，"
         "说明储能仍遵循低价充电、高价放电策略。",
-        f"4. 相较固定电价，问题4-2充电量增加 {charge_42_change:.6f} kWh，"
-        f"放电量增加 {discharge_42_change:.6f} kWh；电价峰谷价差扩大后，"
-        "储能套利空间增加。",
+        f"4. 相较固定电价，问题4-2充电量变化 {charge_42_change:.6f} kWh，"
+        f"放电量变化 {discharge_42_change:.6f} kWh；实际充放电量由"
+        "价格峰谷、光伏情景和跨日SOC边界共同决定。",
         f"5. 问题4-3紧急购电量比问题3增加 {emergency_43_change:.6f} kWh，"
         f"变化率 {emergency_43_change_pct:.6f}%，说明实时电价主要改变购电价格和充放电时机，"
         "没有显著扩大预测误差造成的供电缺口。",
-        f"6. 问题4-3从仅使用0:00预报到使用18:00前滚动更新，总费用下降 "
-        f"{rolling_saving:.6f} 元；6:00、12:00、18:00 的更新均未增加费用，"
-        "其中12:00后的更新对紧急购电下降贡献最明显。",
+        "6. 问题4-3在6:00、12:00、18:00只更新尚未执行时段的购电量，"
+        "储能动作在相邻更新时点之间按实际负荷、光伏和已观测电价逐步执行。",
         "7. 仅有附件3给出的四个预报时点可用于滚动验证，因此不能从现有附件"
         "直接证明增加其他预报时刻一定有效。",
     ]
@@ -629,8 +620,14 @@ def main() -> None:
     forecasts = read_attachment3(inputs["attachment3"])
     price_by_date = read_price_matrix(inputs["attachment4"])
     causal_price_forecast = build_causal_price_forecast(price_by_date)
+    fallback_load_profile = read_attachment1_load_energy(inputs["attachment1"])
     data = prepare_actual_data(p2, inputs["attachment2"], price_by_date)
     fixed_data = build_fixed_price_data(p2, data, inputs["attachment1"])
+    fixed_price = p2.read_price_curve(inputs["attachment1"])
+    fixed_price_by_date = {
+        current_date: fixed_price.copy()
+        for current_date in sorted(price_by_date)
+    }
 
     print("问题4附件路径：")
     for key, value in inputs.items():
@@ -644,9 +641,22 @@ def main() -> None:
     figures_dir = output_dir / "figures"
     for directory in (output_dir, tables_dir, figures_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    for stale_path in (
+        figures_dir / "问题4-3_预报更新时点_边际价值.png",
+        tables_dir / "问题4-3_预报更新情景逐日.csv",
+        tables_dir / "问题4-3_预报更新情景汇总.csv",
+    ):
+        stale_path.unlink(missing_ok=True)
 
-    # 问题4-2：波动电价、实际光伏、按问题2口径。
-    detail42, daily42 = solve_problem42_year(data, storage)
+    # 问题4-2：联合历史情景制定计划，实际数据逐10分钟执行储能。
+    detail42, daily42 = solve_problem42_year(
+        data,
+        forecasts,
+        price_by_date,
+        causal_price_forecast,
+        storage,
+        fallback_load_profile,
+    )
     validation42 = validate_result_detail(
         detail42,
         storage,
@@ -654,12 +664,14 @@ def main() -> None:
     )
     specified42 = summarize_specified_dates(daily42, include_adjustment=False)
 
-    # 问题4-3：波动电价、附件3预报、按问题3滚动调整。
+    # 问题4-3：0:00固定g，6:00、12:00、18:00更新q，储能实时执行。
     detail43, daily43, scenarios43 = solve_problem43_year(
         data,
         forecasts,
         storage,
+        price_by_date,
         decision_price_by_date=causal_price_forecast,
+        fallback_load_profile_kwh=fallback_load_profile,
     )
     validation43 = validate_result_detail(
         detail43,
@@ -672,7 +684,11 @@ def main() -> None:
     print("问题4步骤2：重算问题2、问题3固定电价基准。")
     fixed_detail42, fixed_daily42 = solve_problem42_year(
         fixed_data,
+        forecasts,
+        fixed_price_by_date,
+        fixed_price_by_date,
         storage,
+        fallback_load_profile,
     )
     validation_fixed42 = validate_result_detail(
         fixed_detail42,
@@ -683,6 +699,9 @@ def main() -> None:
         fixed_data,
         forecasts,
         storage,
+        fixed_price_by_date,
+        decision_price_by_date=fixed_price_by_date,
+        fallback_load_profile_kwh=fallback_load_profile,
     )
     validation_fixed43 = validate_result_detail(
         fixed_detail43,
@@ -701,8 +720,21 @@ def main() -> None:
         detail42,
         detail43,
     )
-    scenario_summary = aggregate_forecast_scenarios(
-        scenarios43.to_dict(orient="records")
+    scenario_summary = (
+        aggregate_forecast_scenarios(scenarios43.to_dict(orient="records"))
+        if not scenarios43.empty
+        else pd.DataFrame(
+            columns=[
+                "情景",
+                "计划购电量_kWh",
+                "调整购电量_kWh",
+                "紧急购电量_kWh",
+                "计划购电费_元",
+                "调整费用_元",
+                "紧急购电费_元",
+                "总费用_元",
+            ]
+        )
     )
     forecast_sensitivity, price_sensitivity = run_volatile_price_sensitivity(
         p2,
@@ -762,16 +794,18 @@ def main() -> None:
         index=False,
         encoding="utf-8-sig",
     )
-    scenarios43.to_csv(
-        tables_dir / "问题4-3_预报更新情景逐日.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    scenario_summary.to_csv(
-        tables_dir / "问题4-3_预报更新情景汇总.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    if not scenarios43.empty:
+        scenarios43.to_csv(
+            tables_dir / "问题4-3_预报更新情景逐日.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    if not scenario_summary.empty:
+        scenario_summary.to_csv(
+            tables_dir / "问题4-3_预报更新情景汇总.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     forecast_sensitivity.to_csv(
         tables_dir / "问题4-3_预报缩放灵敏度.csv",
         index=False,
@@ -819,10 +853,11 @@ def main() -> None:
         storage,
         figures_dir / "问题4-3_指定日期_储能充放电与储电量.png",
     )
-    plot_scenarios(
-        scenarios43,
-        figures_dir / "问题4-3_预报更新时点_边际价值.png",
-    )
+    if not scenarios43.empty:
+        plot_scenarios(
+            scenarios43,
+            figures_dir / "问题4-3_预报更新时点_边际价值.png",
+        )
     plot_q42_q43_comparison(
         daily42,
         daily43,
@@ -845,14 +880,14 @@ def main() -> None:
     )
     summary = {
         "问题4-3价格信息口径": {
-            "决策价格": "仅使用附件4中决策日之前已实现数据的按时段历史均值",
+            "决策价格": "负荷、光伏和电价按同一历史日期配对；更新时点只用已观察价格和历史同日价格增量",
             "结算价格": "使用附件4当日对应时段实际实时电价",
             "未来实时电价前视": "禁止",
         },
         "储能边界": {
             "跨日连续": True,
-            "每日0:00储电量_kWh": 6000.0,
-            "每日24:00储电量_kWh": 6000.0,
+            "2025-01-01 0:00储电量_kWh": 6000.0,
+            "正式输出期": "2025-02-01至2025-12-31",
         },
         "问题4-2": {
             "计划购电量_kWh": float(daily42["计划购电量_kWh"].sum()),
