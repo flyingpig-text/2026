@@ -243,6 +243,7 @@ def _build_single_day_recourse_model(
     upper[d_slice] = M
     lower[e_slice] = storage.soc_min_kwh
     upper[e_slice] = storage.soc_max_kwh
+    upper[u_slice] = pv_scenarios_kwh.reshape(-1)
     upper[eta_index] = np.inf
     upper[z_slice] = np.inf
 
@@ -307,6 +308,27 @@ def _build_single_day_recourse_model(
         LinearConstraint(balance_matrix, balance_rhs, balance_rhs),
         LinearConstraint(soc_matrix, soc_rhs, soc_rhs),
     ]
+    # 连续松弛下用凸包约束 c_t+d_t<=M 限制同段对冲规模。
+    # 实际执行仍通过互斥分支严格保证不会同时充放电。
+    mutual_rows = np.repeat(np.arange(n_day), 2)
+    mutual_cols = np.column_stack(
+        [
+            c_slice.start + np.arange(n_day),
+            d_slice.start + np.arange(n_day),
+        ]
+    ).reshape(-1)
+    mutual_values = np.tile(np.array([1.0, 1.0]), n_day)
+    mutual_matrix = coo_matrix(
+        (mutual_values, (mutual_rows, mutual_cols)),
+        shape=(n_day, variable_count),
+    ).tocsr()
+    constraints.append(
+        LinearConstraint(
+            mutual_matrix,
+            np.full(n_day, -np.inf),
+            np.full(n_day, M),
+        )
+    )
     if cvar_weight > 0.0:
         cvar_matrix_rows: list[int] = []
         cvar_matrix_cols: list[int] = []
@@ -810,9 +832,9 @@ def solve_adaptive_rolling(
     storage: StorageParameters,
     *,
     initial_soc_kwh: float | None = None,
-    terminal_soc_value_yuan_per_kwh: float | None = None,
+    terminal_soc_value_yuan_per_kwh: float | None = 0.0,
     emergency_multiplier: float = EMERGENCY_MULTIPLIER,
-    warmup_days: int = 31,
+    warmup_days: int = 0,
     soc_grid_points: int = 61,
     planning_mode: str = "scenario_recourse",
     planning_scenario_count: int | None = None,
@@ -850,12 +872,9 @@ def solve_adaptive_rolling(
     if initial_soc_kwh is None:
         initial_soc_kwh = storage.initial_kwh
     if terminal_soc_value_yuan_per_kwh is None:
-        from problem2_stochastic import compute_terminal_soc_value
-
-        terminal_soc_value_yuan_per_kwh = compute_terminal_soc_value(
-            price_144_yuan_per_kwh,
-            storage,
-        )
+        terminal_soc_value_yuan_per_kwh = 0.0
+    if terminal_soc_value_yuan_per_kwh < 0.0:
+        raise ValueError("日末库存续存价值不能为负。")
     if not 0 <= warmup_days <= days:
         raise ValueError("warmup_days必须位于0--365。")
 

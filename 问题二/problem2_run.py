@@ -175,6 +175,29 @@ def output_period_slice() -> slice:
     return slice(start, stop)
 
 
+def forecast_backtest_metrics(
+    actual_matrix: np.ndarray,
+    forecast_matrix: np.ndarray,
+    output_mask: slice,
+) -> dict[str, float]:
+    """按正式输出期计算滚动样本外预测的 MAE、RMSE 和 WAPE。"""
+    actual = np.asarray(actual_matrix, dtype=float).reshape(-1)[output_mask]
+    forecast = np.asarray(forecast_matrix, dtype=float).reshape(-1)[output_mask]
+    if actual.shape != forecast.shape:
+        raise ValueError("预测回测的实际值和预测值维度不一致。")
+    error = forecast - actual
+    denominator = float(np.sum(np.abs(actual)))
+    return {
+        "MAE_kWh": float(np.mean(np.abs(error))),
+        "RMSE_kWh": float(np.sqrt(np.mean(error**2))),
+        "WAPE_%": (
+            float(np.sum(np.abs(error)) / denominator * 100.0)
+            if denominator > 0.0
+            else float("nan")
+        ),
+    }
+
+
 def write_stochastic_report(
     output_path: Path,
     storage: core.StorageParameters,
@@ -216,12 +239,17 @@ def write_stochastic_report(
         f"- 计划购电采用 {planning_scenarios} 个代表情景的场景追索模型，"
         "并加入风险下限。",
         f"- 历史误差回看窗口为 {lookback_days} 天。",
-        f"- 1 月储能待机预热 {warmup_days} 天，2 月 1 日从 6000 kWh 开始。",
+        (
+            f"- 自 2025-01-01 起连续滚动，不使用储能待机预热。"
+            if warmup_days == 0
+            else f"- 1 月储能待机预热 {warmup_days} 天，2 月 1 日从 6000 kWh 开始。"
+        ),
         f"- 实际执行未来价值使用 {soc_grid_points} 点 SOC 网格。",
         f"- 误差衰减系数使用此前 {error_lookback_days} 天估计。",
         f"- 未来价值函数每 {value_update_periods} 个10分钟时段重算。",
         f"- 未来价值情景采用 {trim_fraction:.0%} 截尾平均。",
-        f"- 续存价值倍率为 {terminal_value_factor:.6f}。",
+        f"- 续存价值倍率为 {terminal_value_factor:.6f}；"
+        f"题目未规定时默认取 0，不加入额外库存收益。",
         f"- 未利用供能惩罚占电价比例为 {curtail_penalty_fraction:.2%}。",
         f"- 充放电循环正则项为 {cycle_penalty_yuan_per_kwh:.6f} 元/kWh。",
         f"- CVaR权重为 {cvar_weight:.4f}，置信水平为 {cvar_alpha:.2f}。",
@@ -427,11 +455,14 @@ def main() -> None:
             f"每天概率和={probabilities[0].sum():.10f}，"
             f"低负载日数={int(np.sum(day_types == 0))}。"
         )
-        legacy.log(
-            "日末库存续存价值："
-            f"v={terminal_soc_value:.6f} 元/kWh，"
-            "v 由0:00--5:00平均电价除以放电效率计算。"
-        )
+        if abs(terminal_soc_value) <= 1e-12:
+            legacy.log("日末库存续存价值：默认关闭，v=0 元/kWh。")
+        else:
+            legacy.log(
+                "日末库存续存价值："
+                f"v={terminal_soc_value:.6f} 元/kWh，"
+                "v 由0:00--5:00平均电价除以放电效率计算。"
+            )
         legacy.log("步骤4：逐日求解场景追索计划，并按真实数据动态执行储能")
         adaptive_result = adaptive.solve_adaptive_rolling(
             load_scenarios,
@@ -478,6 +509,8 @@ def main() -> None:
             + adaptive_result.expected_emergency_cost_yuan
             - adaptive_result.expected_plan_objective_yuan
         )
+        if abs(expected_terminal_value) < 1e-6:
+            expected_terminal_value = 0.0
         stochastic_solution = stochastic.StochasticSolution(
             planned_kwh=adaptive_result.planned_kwh,
             charge_kwh=adaptive_result.charge_kwh,
@@ -741,6 +774,30 @@ def main() -> None:
     specified = legacy.specified_day_table(detail, daily)
     table3 = legacy.build_table3(detail)
     output_summary = legacy.output_period_summary(daily)
+    if args.model == "stochastic":
+        forecast_backtest = {
+            "评估期": "2025-02-01至2025-12-31",
+            "负荷": forecast_backtest_metrics(
+                load_matrix,
+                load_forecast_matrix,
+                output_mask,
+            ),
+            "光伏": forecast_backtest_metrics(
+                pv_matrix,
+                pv_forecast_matrix,
+                output_mask,
+            ),
+        }
+        baseline_improvement_pct = (
+            (baseline_output_cost - output_summary["总购电费_元"])
+            / baseline_output_cost
+            * 100.0
+            if baseline_output_cost > 0.0
+            else float("nan")
+        )
+    else:
+        forecast_backtest = None
+        baseline_improvement_pct = None
 
     legacy.log("步骤9：导出结果文件")
     result2_path = output_dir / "result2.xlsx"
@@ -917,6 +974,8 @@ def main() -> None:
         "约束复核": validation,
         "输出期汇总": output_summary,
         "模型费用": model_summary,
+        "预测回测": forecast_backtest,
+        "相对储能待机基准改善率_%": baseline_improvement_pct,
         "逐日滚动主结果": rolling_summary,
         "SOC终端策略对比": terminal_comparison.to_dict(
             orient="records"

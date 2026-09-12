@@ -828,7 +828,7 @@ def solve_rolling_stochastic_plan(
     *,
     emergency_multiplier: float = EMERGENCY_MULTIPLIER,
     initial_soc_kwh: float | None = None,
-    terminal_soc_value_yuan_per_kwh: float | None = None,
+    terminal_soc_value_yuan_per_kwh: float | None = 0.0,
     soc_final_policy: str = "free",
     tie_break_epsilon: float = 1e-6,
     time_limit_s: float = 60.0,
@@ -848,10 +848,7 @@ def solve_rolling_stochastic_plan(
     if initial_soc_kwh is None:
         initial_soc_kwh = storage.initial_kwh
     if terminal_soc_value_yuan_per_kwh is None:
-        terminal_soc_value_yuan_per_kwh = compute_terminal_soc_value(
-            price_144_yuan_per_kwh,
-            storage,
-        )
+        terminal_soc_value_yuan_per_kwh = 0.0
 
     n = days * periods
     planned = np.empty(n, dtype=float)

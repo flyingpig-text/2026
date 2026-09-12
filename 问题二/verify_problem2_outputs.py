@@ -18,6 +18,8 @@ import matplotlib.image as mpimg
 import numpy as np
 from openpyxl import load_workbook
 
+from problem2_complete_solution import find_project_paths
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -63,6 +65,34 @@ def verify_result2() -> None:
             f"计划购电表维度错误：{plan.max_row}行×{plan.max_column}列。"
         )
     plan_rows = list(plan.iter_rows(values_only=True))
+    template_path = find_project_paths(SCRIPT_DIR)["template"]
+    template_workbook = load_workbook(
+        template_path,
+        read_only=True,
+        data_only=True,
+    )
+    template_headers = next(
+        template_workbook["计划购电量"].iter_rows(values_only=True)
+    )
+    template_workbook.close()
+    expected_headers = [str(value) for value in template_headers[1:145]]
+    actual_headers = [str(value) for value in plan_rows[0][1:145]]
+    if actual_headers != expected_headers:
+        mismatch = next(
+            (
+                (index, actual, expected)
+                for index, (actual, expected) in enumerate(
+                    zip(actual_headers, expected_headers),
+                    start=1,
+                )
+                if actual != expected
+            ),
+            None,
+        )
+        raise AssertionError(
+            "计划购电表时间表头与官方模板不一致："
+            f"第一个差异={mismatch}。"
+        )
     if plan_rows[1][0].strftime("%Y-%m-%d") != "2025-02-01":
         raise AssertionError("计划购电表首行日期不是2025-02-01。")
     if plan_rows[-1][0].strftime("%Y-%m-%d") != "2025-12-31":
@@ -192,6 +222,11 @@ def verify_table3() -> None:
         raise AssertionError(f"表3日期错误：{actual_dates}")
     for row in worksheet.iter_rows(min_row=3, values_only=True):
         for index in range(4):
+            time_value = row[1 + index * 2]
+            if isinstance(time_value, str) and time_value.strip() == "无":
+                raise AssertionError(
+                    f"表3日期{expected_dates[index]}将无事件写成了“无”。"
+                )
             quantity = row[2 + index * 2]
             if quantity is None:
                 continue
@@ -234,8 +269,15 @@ def verify_summary() -> None:
         raise AssertionError("保守计划购电代表情景数应为5。")
     if summary["历史回看天数"] != 30:
         raise AssertionError("正式历史回看天数应为30。")
-    if summary["储能待机预热天数"] != 31:
-        raise AssertionError("储能待机预热天数应为31。")
+    if summary["储能待机预热天数"] != 0:
+        raise AssertionError("正式模型储能待机预热天数应为0。")
+    if summary["续存价值倍率"] != 0.0:
+        raise AssertionError("正式模型的续存价值倍率应关闭为0。")
+    if "预测回测" not in summary or summary["预测回测"] is None:
+        raise AssertionError("summary中缺少逐日滚动预测回测结果。")
+    terminal_value = summary["模型费用"]["日末库存续存价值_元每kWh"]
+    if abs(float(terminal_value)) > 1e-12:
+        raise AssertionError("正式模型不应给日末库存附加题外价值。")
     if summary["未来价值SOC网格点数"] not in {61, 101}:
         raise AssertionError("未来价值SOC网格点数不是支持的61或101。")
 

@@ -1088,6 +1088,8 @@ def write_table3_excel(table3: pd.DataFrame, output_path: Path) -> None:
             if offset >= len(block):
                 continue
             row = block.iloc[offset]
+            if str(row["紧急购电时间段"]).strip() in {"", "无", "nan"}:
+                continue
             start_column = 2 + index * 2
             worksheet.cell(3 + offset, start_column, row["紧急购电时间段"])
             worksheet.cell(
@@ -1147,7 +1149,7 @@ def write_result2(
         & (detail["日期"].dt.date <= OUTPUT_END)
     ]
 
-    # 工作表1：计划购电量。官方列头保持不变，数值按附件时间点顺序写入。
+    # 工作表1：计划购电量。完整保留官方模板的表头、列顺序和格式。
     plan_ws = workbook["计划购电量"]
     plan_row_styles = [
         copy(plan_ws.cell(2, column)._style)
@@ -1848,8 +1850,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warmup-days",
         type=int,
-        default=31,
-        help="储能待机预热天数；默认31天，使2月1日从6000 kWh开始。",
+        default=0,
+        help="储能待机预热天数；默认为0，从2025-01-01起连续滚动。",
     )
     parser.add_argument(
         "--soc-grid-points",
@@ -1878,8 +1880,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--terminal-value-factor",
         type=float,
-        default=1.0,
-        help="续存价值倍率；用于校准库存保留强度。",
+        default=0.0,
+        help="续存价值倍率；题目未规定，默认0，不加入额外库存收益。",
     )
     parser.add_argument(
         "--curtail-penalty-fraction",
@@ -1963,7 +1965,7 @@ def main() -> None:
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
-        else script_dir / "output"
+        else script_dir / "output_legacy"
     )
     tables_dir = output_dir / "tables"
     figures_dir = output_dir / "figures"
