@@ -41,7 +41,7 @@ OUTPUT_END = date(2025, 12, 31)
 EMERGENCY_MULTIPLIER = 5.0
 DOWN_ADJUSTMENT_MULTIPLIER = 0.5
 UP_ADJUSTMENT_MULTIPLIER = 1.5
-SETTLEMENT_MODES = ("plan_full", "actual_base")
+SETTLEMENT_MODES = ("plan_full",)
 FOUR_HOUR_BLOCKS = (
     "0:00-4:00",
     "4:00-8:00",
@@ -182,7 +182,19 @@ def read_price_matrix(path: Path) -> dict[date, np.ndarray]:
     expected_dates = pd.date_range("2025-01-01", "2025-12-31", freq="D")
     if not np.array_equal(dates.to_numpy(), expected_dates.to_numpy()):
         raise ValueError("附件4日期未完整覆盖2025年。")
-    values = raw.iloc[:, 1:].apply(pd.to_numeric, errors="raise").to_numpy(dtype=float)
+    p2 = load_problem2_module()
+    end_minutes = np.asarray(
+        [p2.parse_end_minutes(value) for value in raw.columns[1:]],
+        dtype=int,
+    )
+    order = np.argsort(end_minutes)
+    if not np.array_equal(end_minutes[order], np.arange(10, 1441, 10)):
+        raise ValueError("附件4时间列不是0:10至0:00+1的连续10分钟序列。")
+    values = (
+        raw.iloc[:, 1:]
+        .apply(pd.to_numeric, errors="raise")
+        .to_numpy(dtype=float)[:, order]
+    )
     if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
         raise ValueError("附件4电价必须为有限正值。")
     if values.min() < 0.001 or values.max() > 10.0:
@@ -288,6 +300,58 @@ def read_attachment1_load_energy(path: Path) -> np.ndarray:
     if not np.all(np.isfinite(load_kw)) or np.any(load_kw < 0.0):
         raise ValueError("附件1小区负载必须为有限非负值，单位kW。")
     return load_kw * DT_H
+
+
+def read_attachment1_load_pv_energy(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """读取附件1的负荷和光伏预测，返回两个144维电量数组，单位kWh。"""
+    raw = pd.read_excel(path, engine="openpyxl")
+    normalized = {
+        str(column).replace(" ", "").replace("\n", ""): column
+        for column in raw.columns
+    }
+    time_column = next(
+        (column for name, column in normalized.items() if "时间" in name),
+        None,
+    )
+    load_column = next(
+        (column for name, column in normalized.items() if "小区负载" in name),
+        None,
+    )
+    pv_column = next(
+        (
+            column
+            for name, column in normalized.items()
+            if "光伏" in name and "预测" in name
+        ),
+        None,
+    )
+    if time_column is None or load_column is None or pv_column is None:
+        raise ValueError("附件1必须包含时间、小区负载和光伏预测功率列。")
+
+    p2 = load_problem2_module()
+    selected = raw[[time_column, load_column, pv_column]].copy()
+    selected.columns = ["时间", "小区负载", "光伏预测"]
+    selected = selected.dropna(how="all").reset_index(drop=True)
+    if len(selected) != T:
+        raise ValueError(f"附件1负荷和光伏预测必须为{T}个点。")
+    end_minutes = np.asarray(
+        [p2.parse_end_minutes(value) for value in selected["时间"]],
+        dtype=int,
+    )
+    order = np.argsort(end_minutes)
+    if not np.array_equal(end_minutes[order], np.arange(10, 1441, 10)):
+        raise ValueError("附件1时间列不是连续的10分钟序列。")
+    load_kw = pd.to_numeric(selected["小区负载"], errors="raise").to_numpy(
+        dtype=float
+    )[order]
+    pv_kw = pd.to_numeric(selected["光伏预测"], errors="raise").to_numpy(
+        dtype=float
+    )[order]
+    if not np.all(np.isfinite(load_kw)) or not np.all(np.isfinite(pv_kw)):
+        raise ValueError("附件1负荷或光伏预测存在非有限值。")
+    if np.any(load_kw < 0.0) or np.any(pv_kw < 0.0):
+        raise ValueError("附件1负荷或光伏预测不能为负。")
+    return load_kw * DT_H, pv_kw * DT_H
 
 
 def hourly_forecast_to_intervals(
@@ -1058,8 +1122,80 @@ def write_official_result(
         )
     write_charge_sheet(workbook["充放电量"], detail, storage)
     write_emergency_sheet(workbook["紧急购电量"], detail)
+    validate_official_result_workbook(
+        workbook,
+        dates=sorted(detail["日期"].dt.date.unique()),
+        include_adjustment=include_adjustment,
+    )
     workbook.save(output_path)
     workbook.close()
+
+
+def validate_official_result_workbook(
+    workbook,
+    dates: list[date],
+    include_adjustment: bool,
+) -> None:
+    """校验结果工作簿保持官方模板的工作表、行列和日期结构。"""
+    required = (
+        ["计划购电量", "调整购电量", "充放电量", "紧急购电量"]
+        if include_adjustment
+        else ["计划购电量", "充放电量", "紧急购电量"]
+    )
+    if workbook.sheetnames != required:
+        raise ValueError(
+            f"官方模板工作表应为{required}，实际为{workbook.sheetnames}。"
+        )
+    if len(dates) != 334:
+        raise ValueError(f"官方模板结果应覆盖334天，实际为{len(dates)}天。")
+    expected_dates = list(
+        pd.date_range(OUTPUT_START, OUTPUT_END, freq="D").date
+    )
+    if dates != expected_dates:
+        raise ValueError("结果日期未严格覆盖2025-02-01至2025-12-31。")
+
+    wide_sheets = ["计划购电量"]
+    if include_adjustment:
+        wide_sheets.append("调整购电量")
+    for sheet_name in wide_sheets:
+        worksheet = workbook[sheet_name]
+        if worksheet.max_column != 147:
+            raise ValueError(f"{sheet_name}应为147列，实际为{worksheet.max_column}。")
+        if worksheet.max_row != len(dates) + 1:
+            raise ValueError(
+                f"{sheet_name}应为{len(dates) + 1}行，实际为{worksheet.max_row}。"
+            )
+        sheet_dates = [
+            worksheet.cell(row_index, 1).value
+            for row_index in range(2, worksheet.max_row + 1)
+        ]
+        if any(not isinstance(value, datetime) for value in sheet_dates):
+            raise ValueError(f"{sheet_name}日期列必须为Excel日期。")
+        actual_dates = [value.date() for value in sheet_dates]
+        if actual_dates != dates:
+            raise ValueError(f"{sheet_name}日期顺序与结果不一致。")
+
+    charge = workbook["充放电量"]
+    charge_header = ("日期", "时间段", "充电量", "放电量", "时刻", "储电量")
+    actual_charge_header = tuple(
+        charge.cell(1, column).value for column in range(1, 7)
+    )
+    if actual_charge_header != charge_header:
+        raise ValueError(
+            f"充放电量表头应为{charge_header}，实际为{actual_charge_header}。"
+        )
+    if charge.max_column != 6 or charge.max_row != 1 + len(dates) * 6:
+        raise ValueError("充放电量工作表行列结构不符合官方模板。")
+
+    emergency = workbook["紧急购电量"]
+    emergency_header = ("日期", "购电时间段", "购电量")
+    actual_emergency_header = tuple(
+        emergency.cell(1, column).value for column in range(1, 4)
+    )
+    if actual_emergency_header != emergency_header:
+        raise ValueError(
+            f"紧急购电量表头应为{emergency_header}，实际为{actual_emergency_header}。"
+        )
 
 
 def summarize_specified_dates(

@@ -628,7 +628,7 @@ def plot_storage(detail: pd.DataFrame, storage, output_path: Path) -> None:
         ax2 = ax.twinx()
         soc = np.concatenate(
             (
-                [storage.initial_kwh],
+                [float(day.iloc[0]["时段初储电量_kWh"])],
                 day["时段末储电量_kWh"].to_numpy(dtype=float),
             )
         )

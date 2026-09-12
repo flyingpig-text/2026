@@ -26,7 +26,7 @@ UPDATE_HOURS = (6, 12, 18)
 EMERGENCY_MULTIPLIER = 5.0
 DOWN_ADJUSTMENT_MULTIPLIER = 0.5
 UP_ADJUSTMENT_MULTIPLIER = 1.5
-SETTLEMENT_MODES = ("plan_full", "actual_base")
+SETTLEMENT_MODES = ("plan_full",)
 SOC_BOUND_TOLERANCE_KWH = 1e-6
 
 
@@ -868,6 +868,7 @@ def solve_flexible_purchase_stage(
     initial_soc_kwh: float,
     *,
     plan_purchase_kwh: np.ndarray | None = None,
+    current_intervals: int | None = None,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     time_limit_s: float = 60.0,
     scenario_price_yuan_per_kwh: np.ndarray | None = None,
@@ -938,15 +939,28 @@ def solve_flexible_purchase_stage(
     adjustment_mode = plan_purchase_kwh is not None
     if adjustment_mode:
         plan_purchase = np.asarray(plan_purchase_kwh, dtype=float)
-        if plan_purchase.shape != (horizon,):
-            raise ValueError("基准计划购电量长度必须等于优化时段数。")
+        if current_intervals is None:
+            current_intervals = horizon
+        if not 1 <= int(current_intervals) <= horizon:
+            raise ValueError("当前日剩余时段数必须位于1至优化时段数之间。")
+        current_intervals = int(current_intervals)
+        if plan_purchase.shape != (current_intervals,):
+            raise ValueError("基准计划购电量长度必须等于当前日剩余时段数。")
     else:
         plan_purchase = np.zeros(horizon, dtype=float)
+        current_intervals = horizon
 
     objective = np.zeros(variable_count, dtype=float)
     if adjustment_mode:
-        objective[up_slice] = UP_ADJUSTMENT_MULTIPLIER * price
-        objective[down_slice] = DOWN_ADJUSTMENT_MULTIPLIER * price
+        objective[
+            up_slice.start : up_slice.start + current_intervals
+        ] = UP_ADJUSTMENT_MULTIPLIER * price[:current_intervals]
+        objective[
+            down_slice.start : down_slice.start + current_intervals
+        ] = DOWN_ADJUSTMENT_MULTIPLIER * price[:current_intervals]
+        objective[
+            q_slice.start + current_intervals : q_slice.stop
+        ] = price[current_intervals:]
     else:
         objective[q_slice] = price
     emergency_price = (
@@ -973,6 +987,9 @@ def solve_flexible_purchase_stage(
     if not adjustment_mode:
         upper[up_slice] = 0.0
         upper[down_slice] = 0.0
+    else:
+        upper[up_slice.start + current_intervals : up_slice.stop] = 0.0
+        upper[down_slice.start + current_intervals : down_slice.stop] = 0.0
     if terminal_soc_value_yuan_per_kwh > 0.0:
         for scenario in range(scenario_count):
             objective[
@@ -1046,8 +1063,11 @@ def solve_flexible_purchase_stage(
         ),
     ]
     if adjustment_mode:
-        deviation = lil_matrix((horizon, variable_count), dtype=float)
-        for t in range(horizon):
+        deviation = lil_matrix(
+            (current_intervals, variable_count),
+            dtype=float,
+        )
+        for t in range(current_intervals):
             deviation[t, t] = 1.0
             deviation[t, up_slice.start + t] = -1.0
             deviation[t, down_slice.start + t] = 1.0
@@ -1352,10 +1372,10 @@ def _run_live_storage_day(
     )
     plan_window = scenario_windows_by_hour[0]
     plan = solve_flexible_purchase_stage(
-        plan_window["load_kwh"][:, :T],
-        plan_window["pv_kwh"][:, :T],
+        plan_window["load_kwh"],
+        plan_window["pv_kwh"],
         plan_window["probabilities"],
-        plan_window["price_yuan_per_kwh"][:T],
+        plan_window["price_yuan_per_kwh"],
         storage,
         initial_soc_kwh,
         terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
@@ -1384,6 +1404,9 @@ def _run_live_storage_day(
             block_load = window["load_kwh"][:, :block_length]
             block_pv = window["pv_kwh"][:, :block_length]
             block_price = window["price_yuan_per_kwh"][:block_length]
+            full_scenario_price = window.get(
+                "price_scenarios_yuan_per_kwh"
+            )
             block_scenario_price = window.get(
                 "price_scenarios_yuan_per_kwh"
             )
@@ -1392,28 +1415,27 @@ def _run_live_storage_day(
                     block_scenario_price,
                     dtype=float,
                 )[:, :block_length]
-            block_plan = plan_purchase[
-                start_index : start_index + block_length
-            ]
+            suffix_length = T - start_index
 
             if start_hour in update_hours:
                 adjustment = solve_flexible_purchase_stage(
-                    block_load,
-                    block_pv,
+                    window["load_kwh"],
+                    window["pv_kwh"],
                     window["probabilities"],
-                    block_price,
+                    window["price_yuan_per_kwh"],
                     storage,
                     float(soc[start_index]),
-                    plan_purchase_kwh=block_plan,
+                    plan_purchase_kwh=plan_purchase[start_index:],
+                    current_intervals=suffix_length,
                     terminal_soc_value_yuan_per_kwh=(
                         terminal_soc_value_yuan_per_kwh
                     ),
                     time_limit_s=scenario_time_limit_s,
-                    scenario_price_yuan_per_kwh=block_scenario_price,
+                    scenario_price_yuan_per_kwh=full_scenario_price,
                 )
-                adjusted[
-                    start_index : start_index + block_length
-                ] = adjustment["purchase_kwh"]
+                adjusted[start_index:] = adjustment["purchase_kwh"][
+                    :suffix_length
+                ]
 
             execution = execute_block_with_future_value(
                 actual_load_kwh[

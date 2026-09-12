@@ -660,6 +660,7 @@ def execute_day_with_future_value(
     price_144_yuan_per_kwh: np.ndarray,
     storage: StorageParameters,
     *,
+    settlement_price_144_yuan_per_kwh: np.ndarray | None = None,
     initial_soc_kwh: float,
     terminal_soc_value_yuan_per_kwh: float,
     soc_grid_points: int = 61,
@@ -683,6 +684,17 @@ def execute_day_with_future_value(
         raise ValueError("实际光伏必须包含144个时段。")
     if planned_kwh.shape != (period_count,):
         raise ValueError("计划购电必须包含144个时段。")
+    if settlement_price_144_yuan_per_kwh is None:
+        settlement_price = np.asarray(price_144_yuan_per_kwh, dtype=float)
+    else:
+        settlement_price = np.asarray(
+            settlement_price_144_yuan_per_kwh,
+            dtype=float,
+        )
+    if settlement_price.shape != (period_count,):
+        raise ValueError("结算电价必须包含144个时段。")
+    if not np.all(np.isfinite(settlement_price)) or np.any(settlement_price <= 0.0):
+        raise ValueError("结算电价必须为有限正值。")
     if not 0.0 <= error_decay < 1.0:
         raise ValueError("误差衰减系数必须位于 [0,1)。")
     if value_update_periods <= 0:
@@ -779,7 +791,7 @@ def execute_day_with_future_value(
                 )
                 candidate_objective = (
                     emergency_multiplier
-                    * price_144_yuan_per_kwh[period]
+                    * settlement_price[period]
                     * (residual - candidates)
                     + future_value
                 )
@@ -797,10 +809,10 @@ def execute_day_with_future_value(
             - d_value / storage.efficiency
         )
 
-    planned_cost = float(np.dot(price_144_yuan_per_kwh, planned_kwh))
+    planned_cost = float(np.dot(settlement_price, planned_kwh))
     emergency_cost = float(
         emergency_multiplier
-        * np.dot(price_144_yuan_per_kwh, emergency)
+        * np.dot(settlement_price, emergency)
     )
     return DispatchSolution(
         planned_kwh=planned_kwh,
@@ -831,6 +843,8 @@ def solve_adaptive_rolling(
     price_144_yuan_per_kwh: np.ndarray,
     storage: StorageParameters,
     *,
+    planning_price_matrix_yuan_per_kwh: np.ndarray | None = None,
+    settlement_price_matrix_yuan_per_kwh: np.ndarray | None = None,
     initial_soc_kwh: float | None = None,
     terminal_soc_value_yuan_per_kwh: float | None = 0.0,
     emergency_multiplier: float = EMERGENCY_MULTIPLIER,
@@ -868,6 +882,33 @@ def solve_adaptive_rolling(
         raise ValueError("点预测光伏维度必须为 (365,144)。")
     if periods != PERIODS_PER_DAY or days != DAYS:
         raise ValueError("滚动输入必须为 (365,S,144)。")
+    price_144 = np.asarray(price_144_yuan_per_kwh, dtype=float)
+    if price_144.shape != (periods,):
+        raise ValueError("基准电价必须包含144个时段。")
+    planning_price_matrix = (
+        np.tile(price_144, (days, 1))
+        if planning_price_matrix_yuan_per_kwh is None
+        else np.asarray(planning_price_matrix_yuan_per_kwh, dtype=float)
+    )
+    settlement_price_matrix = (
+        planning_price_matrix.copy()
+        if settlement_price_matrix_yuan_per_kwh is None
+        else np.asarray(settlement_price_matrix_yuan_per_kwh, dtype=float)
+    )
+    if planning_price_matrix.shape != (days, periods):
+        raise ValueError("决策电价矩阵维度必须为 (365,144)。")
+    if settlement_price_matrix.shape != (days, periods):
+        raise ValueError("结算电价矩阵维度必须为 (365,144)。")
+    if (
+        not np.all(np.isfinite(planning_price_matrix))
+        or np.any(planning_price_matrix <= 0.0)
+    ):
+        raise ValueError("决策电价矩阵必须为有限正值。")
+    if (
+        not np.all(np.isfinite(settlement_price_matrix))
+        or np.any(settlement_price_matrix <= 0.0)
+    ):
+        raise ValueError("结算电价矩阵必须为有限正值。")
     storage.validate()
     if initial_soc_kwh is None:
         initial_soc_kwh = storage.initial_kwh
@@ -899,6 +940,8 @@ def solve_adaptive_rolling(
     for day in range(days):
         start = day * periods
         stop = start + periods
+        planning_price = planning_price_matrix[day]
+        settlement_price = settlement_price_matrix[day]
         if day < warmup_days:
             # 1月预热：储能待机，日初库存保持6000 kWh。
             day_plan = ScenarioRecoursePlan(
@@ -958,7 +1001,7 @@ def solve_adaptive_rolling(
             current_soc = 6000.0
             day_warmup_cost = float(
                 np.dot(
-                    price_144_yuan_per_kwh,
+                    settlement_price,
                     planned[start:stop],
                 )
             )
@@ -981,12 +1024,12 @@ def solve_adaptive_rolling(
             if purchase_risk_price_quantile < 1.0:
                 price_threshold = float(
                     np.quantile(
-                        price_144_yuan_per_kwh,
+                        planning_price,
                         purchase_risk_price_quantile,
                     )
                 )
                 purchase_floor = np.where(
-                    price_144_yuan_per_kwh >= price_threshold,
+                    planning_price >= price_threshold,
                     purchase_floor,
                     0.0,
                 )
@@ -1028,7 +1071,7 @@ def solve_adaptive_rolling(
                         1.0 / planning_count,
                         dtype=float,
                     ),
-                    price_144_yuan_per_kwh,
+                    planning_price,
                     storage,
                     initial_soc_kwh=current_soc,
                     terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
@@ -1055,7 +1098,7 @@ def solve_adaptive_rolling(
                     planning_probabilities[None, :]
                     if "planning_probabilities" in locals()
                     else scenario_probabilities[day - 1 : day],
-                    price_144_yuan_per_kwh,
+                    planning_price,
                     storage,
                     emergency_multiplier=emergency_multiplier,
                     initial_soc_kwh=current_soc,
@@ -1112,7 +1155,7 @@ def solve_adaptive_rolling(
                     )
                     day_plan.planned_cost_yuan = float(
                         np.dot(
-                            price_144_yuan_per_kwh,
+                            planning_price,
                             day_plan.planned_kwh,
                         )
                     )
@@ -1151,7 +1194,7 @@ def solve_adaptive_rolling(
                 planning_load[None, :, :],
                 planning_pv[None, :, :],
                 planning_probabilities[None, :],
-                price_144_yuan_per_kwh,
+                planning_price,
                 storage,
                 emergency_multiplier=emergency_multiplier,
                 initial_soc_kwh=current_soc,
@@ -1201,9 +1244,10 @@ def solve_adaptive_rolling(
             day_plan.planned_kwh,
             load_scenarios_kwh[day],
             pv_scenarios_kwh[day],
-            price_144_yuan_per_kwh,
+            planning_price,
             storage,
             initial_soc_kwh=current_soc,
+            settlement_price_144_yuan_per_kwh=settlement_price,
             terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
             soc_grid_points=soc_grid_points,
             emergency_multiplier=emergency_multiplier,
@@ -1232,7 +1276,7 @@ def solve_adaptive_rolling(
         total_planned_cost += day_plan.planned_cost_yuan
         total_planned_cost_all += float(
             np.dot(
-                price_144_yuan_per_kwh,
+                settlement_price,
                 planned[start:stop],
             )
         )
@@ -1246,11 +1290,11 @@ def solve_adaptive_rolling(
                 f"当日末SOC={current_soc:.6f} kWh。"
             )
 
-    price_all = np.tile(price_144_yuan_per_kwh, days)
-    planned_cost = float(np.dot(price_all, planned))
+    settlement_price_all = settlement_price_matrix.reshape(-1)
+    planned_cost = float(np.dot(settlement_price_all, planned))
     emergency_cost = float(
         emergency_multiplier
-        * np.dot(price_all, emergency)
+        * np.dot(settlement_price_all, emergency)
     )
     actual_dispatch = DispatchSolution(
         planned_kwh=planned,

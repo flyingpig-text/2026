@@ -32,6 +32,7 @@ from problem3_core import (  # noqa: E402
     prepare_actual_data,
     print_quantity_checks,
     read_attachment1_load_energy,
+    read_attachment1_load_pv_energy,
     read_attachment3,
     read_price_matrix,
     summarize_specified_dates,
@@ -46,10 +47,12 @@ from problem3_run import (  # noqa: E402
     plot_scenarios,
     plot_storage,
 )
+from problem3_algorithm import run_rolling_day  # noqa: E402
 from problem4_core import (  # noqa: E402
     build_causal_price_forecast,
-    solve_problem42_year,
-    solve_problem43_day,
+    build_problem2_forecast_and_scenarios,
+    build_problem4_scenario_windows,
+    solve_problem42_official_year,
     solve_problem43_year,
 )
 
@@ -139,9 +142,14 @@ def run_volatile_price_sensitivity(
     data: pd.DataFrame,
     forecasts: dict,
     price_forecast_by_date: dict,
+    price_by_date: dict,
+    fallback_load_profile_kwh: np.ndarray,
     storage,
+    initial_soc_by_date: dict | None = None,
+    scenario_count: int = 5,
+    lookback_days: int = 30,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """对指定日期做预报缩放和电价缩放灵敏度分析。"""
+    """按主模型口径对指定日期做预报和电价缩放灵敏度分析。"""
     forecast_rows: list[dict[str, object]] = []
     price_rows: list[dict[str, object]] = []
     for target in TARGET_DATES:
@@ -153,15 +161,50 @@ def run_volatile_price_sensitivity(
         )
         load = day["小区负载电量_kWh"].to_numpy(dtype=float)
         actual_pv = day["光伏实际电量_kWh"].to_numpy(dtype=float)
+        initial_soc = (
+            float(initial_soc_by_date[target])
+            if initial_soc_by_date is not None and target in initial_soc_by_date
+            else float(storage.initial_kwh)
+        )
         for scale in (0.90, 0.95, 1.00, 1.05, 1.10):
-            rolling = solve_problem43_day(
+            windows = build_problem4_scenario_windows(
+                data,
+                forecasts,
+                target,
+                price_by_date,
+                decision_price,
+                fallback_load_profile_kwh,
+                scenario_count=scenario_count,
+                lookback_days=lookback_days,
+                forecast_scale=scale,
+            )
+            expected_price = np.asarray(
+                windows[0]["price_yuan_per_kwh"],
+                dtype=float,
+            )
+            decision_load = np.average(
+                np.asarray(windows[0]["load_kwh"], dtype=float),
+                axis=0,
+                weights=np.asarray(
+                    windows[0]["probabilities"],
+                    dtype=float,
+                ),
+            )
+            rolling = run_rolling_day(
                 load_energy_kwh=load,
                 actual_pv_energy_kwh=actual_pv,
-                actual_price_yuan_per_kwh=base_price,
-                decision_price_yuan_per_kwh=decision_price,
+                price_yuan_per_kwh=base_price,
                 forecast_by_hour=forecasts[target],
                 storage=storage,
+                initial_soc_kwh=initial_soc,
                 forecast_scale=scale,
+                decision_price_yuan_per_kwh=expected_price,
+                forecast_load_energy_kwh=decision_load,
+                scenario_windows_by_hour=windows,
+                live_storage_execution=True,
+                terminal_soc_value_yuan_per_kwh=(
+                    float(np.mean(expected_price[:30]) / storage.efficiency)
+                ),
             )
             result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             forecast_rows.append(
@@ -178,13 +221,48 @@ def run_volatile_price_sensitivity(
                     "总费用_元": float(result["total_cost_yuan"]),
                 }
             )
-            rolling = solve_problem43_day(
+            scaled_price_by_date = {
+                current_date: np.asarray(values, dtype=float) * scale
+                for current_date, values in price_by_date.items()
+            }
+            scaled_decision_price = decision_price * scale
+            price_windows = build_problem4_scenario_windows(
+                data,
+                forecasts,
+                target,
+                scaled_price_by_date,
+                scaled_decision_price,
+                fallback_load_profile_kwh,
+                scenario_count=scenario_count,
+                lookback_days=lookback_days,
+                forecast_scale=1.0,
+            )
+            price_expected = np.asarray(
+                price_windows[0]["price_yuan_per_kwh"],
+                dtype=float,
+            )
+            price_decision_load = np.average(
+                np.asarray(price_windows[0]["load_kwh"], dtype=float),
+                axis=0,
+                weights=np.asarray(
+                    price_windows[0]["probabilities"],
+                    dtype=float,
+                ),
+            )
+            rolling = run_rolling_day(
                 load_energy_kwh=load,
                 actual_pv_energy_kwh=actual_pv,
-                actual_price_yuan_per_kwh=base_price * scale,
-                decision_price_yuan_per_kwh=decision_price * scale,
+                price_yuan_per_kwh=base_price * scale,
                 forecast_by_hour=forecasts[target],
                 storage=storage,
+                initial_soc_kwh=initial_soc,
+                decision_price_yuan_per_kwh=price_expected,
+                forecast_load_energy_kwh=price_decision_load,
+                scenario_windows_by_hour=price_windows,
+                live_storage_execution=True,
+                terminal_soc_value_yuan_per_kwh=(
+                    float(np.mean(price_expected[:30]) / storage.efficiency)
+                ),
             )
             price_result = (
                 rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
@@ -258,11 +336,12 @@ def build_regime_comparison_table(
         },
     ]
     comparison = pd.DataFrame(rows)
+    cost_by_model = comparison.set_index("模型")["总费用_元"].to_dict()
     fixed_cost_by_model = {
-        "问题2": float(comparison.loc[0, "总费用_元"]),
-        "问题4-2": float(comparison.loc[0, "总费用_元"]),
-        "问题3": float(comparison.loc[2, "总费用_元"]),
-        "问题4-3": float(comparison.loc[2, "总费用_元"]),
+        "问题2": float(cost_by_model["问题2"]),
+        "问题4-2": float(cost_by_model["问题2"]),
+        "问题3": float(cost_by_model["问题3"]),
+        "问题4-3": float(cost_by_model["问题3"]),
     }
     baseline_cost = comparison["模型"].map(fixed_cost_by_model)
     comparison["相对固定电价费用变化_元"] = (
@@ -297,8 +376,13 @@ def build_strategy_metrics(
         charge = frame["充电量_kWh"].to_numpy(dtype=float)
         discharge = frame["放电量_kWh"].to_numpy(dtype=float)
         emergency = frame["紧急购电量_kWh"].to_numpy(dtype=float)
-        low_threshold = float(np.quantile(price, 0.25))
-        high_threshold = float(np.quantile(price, 0.75))
+        low_mask = np.zeros(len(frame), dtype=bool)
+        high_mask = np.zeros(len(frame), dtype=bool)
+        for _, day in frame.groupby(frame["日期"].dt.date):
+            indices = day.index.to_numpy(dtype=int)
+            day_price = price[indices]
+            low_mask[indices] = day_price <= float(np.quantile(day_price, 0.25))
+            high_mask[indices] = day_price >= float(np.quantile(day_price, 0.75))
         total_charge = float(charge.sum())
         total_discharge = float(discharge.sum())
         charge_price = (
@@ -322,14 +406,14 @@ def build_strategy_metrics(
                 "充放电价差_元每kWh": discharge_price - charge_price,
                 "低价充电占比_百分比": (
                     100.0
-                    * float(charge[price <= low_threshold].sum())
+                    * float(charge[low_mask].sum())
                     / total_charge
                     if total_charge > 0.0
                     else np.nan
                 ),
                 "高价放电占比_百分比": (
                     100.0
-                    * float(discharge[price >= high_threshold].sum())
+                    * float(discharge[high_mask].sum())
                     / total_discharge
                     if total_discharge > 0.0
                     else np.nan
@@ -621,6 +705,9 @@ def main() -> None:
     price_by_date = read_price_matrix(inputs["attachment4"])
     causal_price_forecast = build_causal_price_forecast(price_by_date)
     fallback_load_profile = read_attachment1_load_energy(inputs["attachment1"])
+    reference_load_energy, reference_pv_energy = (
+        read_attachment1_load_pv_energy(inputs["attachment1"])
+    )
     data = prepare_actual_data(p2, inputs["attachment2"], price_by_date)
     fixed_data = build_fixed_price_data(p2, data, inputs["attachment1"])
     fixed_price = p2.read_price_curve(inputs["attachment1"])
@@ -628,6 +715,13 @@ def main() -> None:
         current_date: fixed_price.copy()
         for current_date in sorted(price_by_date)
     }
+    problem2_prebuilt = build_problem2_forecast_and_scenarios(
+        data,
+        reference_load_energy,
+        reference_pv_energy,
+        scenario_count=30,
+        lookback_days=30,
+    )
 
     print("问题4附件路径：")
     for key, value in inputs.items():
@@ -649,13 +743,14 @@ def main() -> None:
         stale_path.unlink(missing_ok=True)
 
     # 问题4-2：联合历史情景制定计划，实际数据逐10分钟执行储能。
-    detail42, daily42 = solve_problem42_year(
+    detail42, daily42 = solve_problem42_official_year(
         data,
-        forecasts,
-        price_by_date,
+        reference_load_energy,
+        reference_pv_energy,
         causal_price_forecast,
+        price_by_date,
         storage,
-        fallback_load_profile,
+        prebuilt=problem2_prebuilt,
     )
     validation42 = validate_result_detail(
         detail42,
@@ -682,13 +777,14 @@ def main() -> None:
 
     # 在同一储能和费用口径下重算问题2、3固定电价基准，保证对比可复现。
     print("问题4步骤2：重算问题2、问题3固定电价基准。")
-    fixed_detail42, fixed_daily42 = solve_problem42_year(
+    fixed_detail42, fixed_daily42 = solve_problem42_official_year(
         fixed_data,
-        forecasts,
+        reference_load_energy,
+        reference_pv_energy,
         fixed_price_by_date,
         fixed_price_by_date,
         storage,
-        fallback_load_profile,
+        prebuilt=problem2_prebuilt,
     )
     validation_fixed42 = validate_result_detail(
         fixed_detail42,
@@ -741,7 +837,13 @@ def main() -> None:
         data,
         forecasts,
         causal_price_forecast,
+        price_by_date,
+        fallback_load_profile,
         storage,
+        initial_soc_by_date={
+            row["日期"].date(): float(row["0:00储电量_kWh"])
+            for _, row in daily43.iterrows()
+        },
     )
     specified_comparison = build_comparison_table(specified42, specified43)
 
