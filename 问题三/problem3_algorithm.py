@@ -868,6 +868,7 @@ def solve_flexible_purchase_stage(
     initial_soc_kwh: float,
     *,
     plan_purchase_kwh: np.ndarray | None = None,
+    fixed_purchase_kwh: np.ndarray | None = None,
     current_intervals: int | None = None,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     time_limit_s: float = 60.0,
@@ -879,6 +880,8 @@ def solve_flexible_purchase_stage(
     计划阶段令plan_purchase_kwh=None，只确定计划购电g。
     预报更新阶段传入对应时段的g，并把相对g的偏差纳入调整费用。
     储能充放电量在每个情景内独立，代表实际运行时可按当时真实数据调整。
+    fixed_purchase_kwh用于评估“保持当前已接受购电量”的剩余期望费用，
+    此时当前日购电量固定，未来预视日仍按正常电价优化。
 
     scenario_price_yuan_per_kwh：
         可选，形状为(情景数,时段数)。给定后，计划购电量按情景期望价格
@@ -946,8 +949,17 @@ def solve_flexible_purchase_stage(
         current_intervals = int(current_intervals)
         if plan_purchase.shape != (current_intervals,):
             raise ValueError("基准计划购电量长度必须等于当前日剩余时段数。")
+        if fixed_purchase_kwh is None:
+            fixed_purchase = None
+        else:
+            fixed_purchase = np.asarray(fixed_purchase_kwh, dtype=float)
+            if fixed_purchase.shape != (current_intervals,):
+                raise ValueError("固定购电量长度必须等于当前日剩余时段数。")
+            if not np.all(np.isfinite(fixed_purchase)) or np.any(fixed_purchase < 0.0):
+                raise ValueError("固定购电量必须为有限非负值。")
     else:
         plan_purchase = np.zeros(horizon, dtype=float)
+        fixed_purchase = None
         current_intervals = horizon
 
     objective = np.zeros(variable_count, dtype=float)
@@ -973,10 +985,6 @@ def solve_flexible_purchase_stage(
         * emergency_price
         * np.repeat(probabilities, horizon)
     )
-    # 消除LP退化造成的无意义同时充放电。
-    objective[c_start:d_start] += 1e-9
-    objective[d_start:soc_start] += 1e-9
-
     lower = np.zeros(variable_count, dtype=float)
     upper = np.full(variable_count, np.inf, dtype=float)
     upper[c_start:d_start] = max_interval_energy
@@ -984,6 +992,9 @@ def solve_flexible_purchase_stage(
     lower[soc_start:emergency_start] = storage.soc_min_kwh
     upper[soc_start:emergency_start] = storage.soc_max_kwh
     upper[curtail_start:variable_count] = pv.reshape(-1)
+    if fixed_purchase is not None:
+        lower[q_slice.start : q_slice.start + current_intervals] = fixed_purchase
+        upper[q_slice.start : q_slice.start + current_intervals] = fixed_purchase
     if not adjustment_mode:
         upper[up_slice] = 0.0
         upper[down_slice] = 0.0
@@ -998,6 +1009,11 @@ def solve_flexible_purchase_stage(
                 probabilities[scenario]
                 * terminal_soc_value_yuan_per_kwh
             )
+
+    economic_objective = objective.copy()
+    solve_objective = objective.copy()
+    solve_objective[c_start:d_start] += 1e-9
+    solve_objective[d_start:soc_start] += 1e-9
 
     scenario_balance = lil_matrix(
         (scenario_count * horizon, variable_count),
@@ -1080,7 +1096,7 @@ def solve_flexible_purchase_stage(
         )
 
     result = milp(
-        c=objective,
+        c=solve_objective,
         integrality=None,
         bounds=Bounds(lower, upper),
         constraints=constraints,
@@ -1096,6 +1112,7 @@ def solve_flexible_purchase_stage(
         "purchase_kwh": _zero_small(solution[q_slice]),
         "up_kwh": _zero_small(solution[up_slice]),
         "down_kwh": _zero_small(solution[down_slice]),
+        "objective_value_yuan": float(economic_objective @ solution),
         "solver_status": str(result.message),
     }
 
@@ -1363,9 +1380,15 @@ def _run_live_storage_day(
     decision_load_kwh: np.ndarray,
     terminal_soc_value_yuan_per_kwh: float,
     scenario_time_limit_s: float,
+    update_saving_threshold_yuan: float = 1.0,
+    update_saving_relative_threshold: float = 1e-4,
     report_update_scenarios: bool = True,
 ) -> RollingDayResult:
     """0:00固定g，预报点更新q，充放电按实际数据实时滚动执行。"""
+    if update_saving_threshold_yuan < 0.0:
+        raise ValueError("更新节省绝对阈值不能为负。")
+    if update_saving_relative_threshold < 0.0:
+        raise ValueError("更新节省相对阈值不能为负。")
     forecast0_kw = expand_hourly_forecast(
         np.asarray(forecast_by_hour[0], dtype=float) * forecast_scale,
         0,
@@ -1396,6 +1419,7 @@ def _run_live_storage_day(
         soc = np.empty(T + 1, dtype=float)
         soc[0] = initial_soc_kwh
         latest_forecast = forecast0_kw.copy()
+        decisions: list[dict[str, float | int | str]] = []
 
         for start_hour in block_hours:
             start_index = start_hour * 6
@@ -1418,7 +1442,8 @@ def _run_live_storage_day(
             suffix_length = T - start_index
 
             if start_hour in update_hours:
-                adjustment = solve_flexible_purchase_stage(
+                current_purchase = adjusted[start_index:].copy()
+                candidate = solve_flexible_purchase_stage(
                     window["load_kwh"],
                     window["pv_kwh"],
                     window["probabilities"],
@@ -1433,9 +1458,52 @@ def _run_live_storage_day(
                     time_limit_s=scenario_time_limit_s,
                     scenario_price_yuan_per_kwh=full_scenario_price,
                 )
-                adjusted[start_index:] = adjustment["purchase_kwh"][
-                    :suffix_length
-                ]
+                try:
+                    keep_current = solve_flexible_purchase_stage(
+                        window["load_kwh"],
+                        window["pv_kwh"],
+                        window["probabilities"],
+                        window["price_yuan_per_kwh"],
+                        storage,
+                        float(soc[start_index]),
+                        plan_purchase_kwh=plan_purchase[start_index:],
+                        fixed_purchase_kwh=current_purchase,
+                        current_intervals=suffix_length,
+                        terminal_soc_value_yuan_per_kwh=(
+                            terminal_soc_value_yuan_per_kwh
+                        ),
+                        time_limit_s=scenario_time_limit_s,
+                        scenario_price_yuan_per_kwh=full_scenario_price,
+                    )
+                except RuntimeError:
+                    keep_value = float("nan")
+                    saving = float("nan")
+                    accepted = True
+                    keep_feasible = 0
+                else:
+                    keep_value = float(keep_current["objective_value_yuan"])
+                    candidate_value = float(candidate["objective_value_yuan"])
+                    saving = keep_value - candidate_value
+                    relative_saving = saving / max(abs(keep_value), 1.0)
+                    accepted = (
+                        saving >= update_saving_threshold_yuan
+                        and relative_saving >= update_saving_relative_threshold
+                    )
+                    keep_feasible = 1
+                if accepted:
+                    adjusted[start_index:] = candidate["purchase_kwh"][
+                        :suffix_length
+                    ]
+                decisions.append(
+                    {
+                        "时点": f"{start_hour}:00",
+                        "是否接受": int(accepted),
+                        "保持费用_元": keep_value,
+                        "优化费用_元": float(candidate["objective_value_yuan"]),
+                        "预计节省_元": saving,
+                        "保持计划可行": keep_feasible,
+                    }
+                )
 
             execution = execute_block_with_future_value(
                 actual_load_kwh[
@@ -1479,6 +1547,7 @@ def _run_live_storage_day(
             "actual_curtail_kwh": curtail,
             "soc_kwh": soc,
             "latest_forecast_kw": latest_forecast,
+            "decisions": decisions,
         }
 
     scenario_rows: list[dict[str, Any]] = []
@@ -1523,6 +1592,21 @@ def _run_live_storage_day(
                         settlement.emergency_cost_yuan.sum()
                     ),
                     "总费用_元": float(settlement.total_cost_yuan),
+                    "更新接受次数": int(
+                        sum(int(item["是否接受"]) for item in simulated["decisions"])
+                    ),
+                    "更新拒绝次数": int(
+                        sum(1 - int(item["是否接受"]) for item in simulated["decisions"])
+                    ),
+                    "保持计划不可行次数": int(
+                        sum(
+                            1 - int(item.get("保持计划可行", 1))
+                            for item in simulated["decisions"]
+                        )
+                    ),
+                    "预计调整节省_元": float(
+                        sum(float(item["预计节省_元"]) for item in simulated["decisions"])
+                    ),
                 }
             )
 
@@ -1575,6 +1659,8 @@ def run_rolling_day(
     live_storage_execution: bool = False,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     scenario_time_limit_s: float = 60.0,
+    update_saving_threshold_yuan: float = 1.0,
+    update_saving_relative_threshold: float = 1e-4,
     report_update_scenarios: bool = True,
 ) -> RollingDayResult:
     """
@@ -1597,6 +1683,8 @@ def run_rolling_day(
         decision_price_yuan_per_kwh：用于制定计划和调整策略的价格预测，
             长度144，元/kWh。若为空，则使用实际价格，仅适用于固定电价或
             完全信息对照模型。问题4-3必须传入因果价格预测，禁止使用未来价格。
+        update_saving_threshold_yuan：接受更新的最小绝对预计节省；
+        update_saving_relative_threshold：接受更新的最小相对预计节省。
     输出：
         RollingDayResult，包含计划、最终购电、充放电、SOC、
         紧急购电、弃光、费用和四个更新时点的情景汇总。
@@ -1648,6 +1736,8 @@ def run_rolling_day(
             decision_load,
             terminal_soc_value_yuan_per_kwh,
             scenario_time_limit_s,
+            update_saving_threshold_yuan,
+            update_saving_relative_threshold,
             report_update_scenarios,
         )
     forecast0_kw = expand_hourly_forecast(

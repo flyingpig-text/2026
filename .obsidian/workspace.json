@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "bc7d43b8e2bb6919",
+        "id": "dc30582a4d45ad0c",
         "type": "tabs",
         "children": [
           {
-            "id": "5bf269f964764f3b",
+            "id": "21356e5c988f4244",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "论文/问题四_模型建立与求解_论文稿.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "问题四_模型建立与求解_论文稿"
+              "title": "新标签页"
             }
           }
         ]
@@ -188,8 +184,15 @@
       "bases:新建数据库": false
     }
   },
-  "active": "5bf269f964764f3b",
+  "active": "21356e5c988f4244",
   "lastOpenFiles": [
+    "问题三/results/~$result3.xlsx",
+    "问题四/output/figures/问题4-3_预报更新时点_边际价值.png",
+    "问题四/output/tables/问题4-3_四类累计更新方案对比.csv",
+    "问题四/output/tables/问题4-3_预报更新情景汇总.csv",
+    "问题四/output/tables/问题4-3_预报更新情景逐日.csv",
+    "论文/问题四_模型建立与求解_论文稿.md",
+    "摘要提示词.md",
     "问题四检验.md",
     "数据溯源.md",
     "问题二/问题二_题目关键约束与输出要求.md",
@@ -199,13 +202,9 @@
     "问题三（凌晨版.zip",
     "问题三.zip",
     "问题三/results/~$表2_指定日期充放电量.xlsx",
-    "问题三/results/~$result3.xlsx",
     "问题四/output/result4-3_template_test.xlsx",
     "问题四/output/result4-2_template_test.xlsx",
     "题目/附件/问题三数据处理结果/tables/表3_指定日期紧急购电量.csv",
-    "题目/附件/问题三数据处理结果/tables/基准算例_储能不动作.csv",
-    "题目/附件/问题三数据处理结果/表3_指定日期紧急购电量.xlsx",
-    "题目/附件/问题三数据处理结果/表2_指定日期充放电量.xlsx",
     "各题模型/问题三_约束提取与模型迁移分析(1).md",
     "各题模型/问题三_约束提取与模型迁移分析.md",
     "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
@@ -222,7 +221,6 @@
     "问题二/output_calibrated_v01/figures/指定日期_充放电功率与储电量.png",
     "问题二/output_calibrated_v01/figures/指定日期_负载光伏净负荷与计划购电.png",
     "问题二/output_calibrated_v02/结果说明.md",
-    "问题二/output_calibrated_v02/figures/灵敏度分析.png",
     "问题二/output_objective_v1/结果说明.md",
     "问题二/output_reserve_v05/结果说明.md",
     "问题二/output_reserve_v1/结果说明.md",
@@ -232,9 +230,6 @@
     "问题二/output_adaptive_test/结果说明.md",
     "题目/附件/问题二数据处理结果/结果说明.md",
     "问题二/output_new/结果说明.md",
-    "题目/附件/问题三数据处理结果/问题三_结果说明.md",
-    "题目/附件/问题二数据处理结果/问题二_结果说明.md",
-    "问题二/output/结果说明.md",
-    "各题模型/第二问_两阶段随机规划_完整推导与检验.md"
+    "题目/附件/问题三数据处理结果/问题三_结果说明.md"
   ]
 }

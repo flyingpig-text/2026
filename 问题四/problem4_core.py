@@ -770,7 +770,9 @@ def solve_problem43_year(
     *,
     scenario_count: int = DEFAULT_SCENARIO_COUNT,
     lookback_days: int = DEFAULT_SCENARIO_LOOKBACK_DAYS,
-    collect_update_scenarios: bool = False,
+    collect_update_scenarios: bool = True,
+    update_saving_threshold_yuan: float = 1.0,
+    update_saving_relative_threshold: float = 1e-4,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     从2025-01-01开始连续求解问题4-3，仅输出2月1日至12月31日。
@@ -850,6 +852,10 @@ def solve_problem43_year(
             scenario_windows_by_hour=windows,
             live_storage_execution=True,
             terminal_soc_value_yuan_per_kwh=terminal_value,
+            update_saving_threshold_yuan=update_saving_threshold_yuan,
+            update_saving_relative_threshold=(
+                update_saving_relative_threshold
+            ),
             report_update_scenarios=collect_update_scenarios,
         )
         result = rolling.as_dict()

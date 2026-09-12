@@ -117,6 +117,18 @@ def parse_args() -> argparse.Namespace:
         default=60.0,
         help="单个情景窗口MILP时间上限，单位秒，默认60。",
     )
+    parser.add_argument(
+        "--update-saving-threshold",
+        type=float,
+        default=1.0,
+        help="接受新预报调整所需的最小预计节省，单位元，默认1。",
+    )
+    parser.add_argument(
+        "--update-saving-relative-threshold",
+        type=float,
+        default=1e-4,
+        help="接受新预报调整所需的最小相对节省，默认0.0001。",
+    )
     return parser.parse_args()
 
 
@@ -187,6 +199,8 @@ def solve_problem3(
     window_days: int = 3,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     scenario_time_limit_s: float = 60.0,
+    update_saving_threshold_yuan: float = 1.0,
+    update_saving_relative_threshold: float = 1e-4,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """从1月1日开始连续运行，输出2月1日至12月31日的滚动结果。"""
     detail_rows: list[dict[str, object]] = []
@@ -235,6 +249,10 @@ def solve_problem3(
             live_storage_execution=True,
             terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
             scenario_time_limit_s=scenario_time_limit_s,
+            update_saving_threshold_yuan=update_saving_threshold_yuan,
+            update_saving_relative_threshold=(
+                update_saving_relative_threshold
+            ),
         )
         result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
         current_soc_kwh = float(result["soc_kwh"][-1])
@@ -464,6 +482,8 @@ def run_forecast_sensitivity(
     window_days: int = 3,
     terminal_soc_value_yuan_per_kwh: float = 0.0,
     scenario_time_limit_s: float = 60.0,
+    update_saving_threshold_yuan: float = 1.0,
+    update_saving_relative_threshold: float = 1e-4,
     fallback_profile_kwh: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """对指定日期进行预报整体缩放灵敏度分析。"""
@@ -512,6 +532,12 @@ def run_forecast_sensitivity(
                 live_storage_execution=True,
                 terminal_soc_value_yuan_per_kwh=terminal_soc_value_yuan_per_kwh,
                 scenario_time_limit_s=scenario_time_limit_s,
+                update_saving_threshold_yuan=(
+                    update_saving_threshold_yuan
+                ),
+                update_saving_relative_threshold=(
+                    update_saving_relative_threshold
+                ),
             )
             result = rolling.as_dict() if hasattr(rolling, "as_dict") else rolling
             rows.append(
@@ -699,6 +725,8 @@ def write_report(
     scenario_lookback_days: int,
     window_days: int,
     terminal_soc_value_yuan_per_kwh: float,
+    update_saving_threshold_yuan: float,
+    update_saving_relative_threshold: float,
 ) -> None:
     """写出问题3结果说明。"""
     period = daily[
@@ -772,7 +800,9 @@ def write_report(
         f"- 情景生成参考{window_days}天跨日窗口，实时执行使用单位储能价值"
         f" {terminal_soc_value_yuan_per_kwh:.6f} 元/kWh。",
         "- 每天0:00使用0:00预报确定计划购电量g，g在当天剩余时段锁定。",
-        "- 6:00、12:00、18:00只更新此后尚未执行时段的购电量q，不回改g。",
+        "- 6:00、12:00、18:00先比较保持当前计划与重新优化的同一情景剩余费用，"
+        f"仅当预计节省不低于{update_saving_threshold_yuan:.6f}元且相对节省不低于"
+        f"{update_saving_relative_threshold:.6%}时接受更新。",
         "- 充放电量c、d按实际负荷和实际光伏逐10分钟实时调整，"
         "每个时刻只使用当前及过去真实数据。",
         "- 计划购电量高于调整购电量部分按交易时刻电价50%计违约费用。",
@@ -854,6 +884,10 @@ def main() -> None:
         raise ValueError("终端储能价值倍率不能为负。")
     if args.scenario_time_limit <= 0.0:
         raise ValueError("情景MILP时间上限必须为正。")
+    if args.update_saving_threshold < 0.0:
+        raise ValueError("更新节省绝对阈值不能为负。")
+    if args.update_saving_relative_threshold < 0.0:
+        raise ValueError("更新节省相对阈值不能为负。")
     script_dir = Path(__file__).resolve().parent
     p2 = load_problem2_module()
     inputs = locate_inputs(script_dir)
@@ -906,6 +940,10 @@ def main() -> None:
         window_days=args.window_days,
         terminal_soc_value_yuan_per_kwh=terminal_soc_value,
         scenario_time_limit_s=args.scenario_time_limit,
+        update_saving_threshold_yuan=args.update_saving_threshold,
+        update_saving_relative_threshold=(
+            args.update_saving_relative_threshold
+        ),
     )
     specified = summarize_specified_dates(daily, include_adjustment=True)
     validation = validate_result_detail(detail, storage, include_adjustment=True)
@@ -928,6 +966,10 @@ def main() -> None:
         window_days=args.window_days,
         terminal_soc_value_yuan_per_kwh=terminal_soc_value,
         scenario_time_limit_s=args.scenario_time_limit,
+        update_saving_threshold_yuan=args.update_saving_threshold,
+        update_saving_relative_threshold=(
+            args.update_saving_relative_threshold
+        ),
         fallback_profile_kwh=fallback_load_profile,
     )
     scenario_summary = aggregate_forecast_scenarios(
@@ -1015,6 +1057,8 @@ def main() -> None:
         args.scenario_lookback_days,
         args.window_days,
         terminal_soc_value,
+        args.update_saving_threshold,
+        args.update_saving_relative_threshold,
     )
     summary = {
         "输出期": {
@@ -1035,12 +1079,15 @@ def main() -> None:
         "情景数量": args.scenarios,
         "历史误差回看天数": args.scenario_lookback_days,
         "滚动窗口天数": args.window_days,
+        "更新节省绝对阈值_元": args.update_saving_threshold,
+        "更新节省相对阈值": args.update_saving_relative_threshold,
         "终端储能价值_元每kWh": terminal_soc_value,
         "计划阶段使用当天未来实际负荷": False,
         "约束校验": validation,
         "指定日期结果": specified.assign(
             日期=specified["日期"].dt.strftime("%Y-%m-%d")
         ).to_dict(orient="records"),
+        "预报更新方案全年对比": scenario_summary.to_dict(orient="records"),
     }
     (tables_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),

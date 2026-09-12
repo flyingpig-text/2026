@@ -549,6 +549,8 @@ def write_report(
     forecast_sensitivity: pd.DataFrame,
     price_sensitivity: pd.DataFrame,
     storage,
+    update_saving_threshold_yuan: float = 1.0,
+    update_saving_relative_threshold: float = 1e-4,
 ) -> None:
     """写问题4结果说明。"""
 
@@ -599,8 +601,11 @@ def write_report(
         "## 模型口径",
         "",
         "- 附件4电价按对应日期和10分钟时段逐点使用。",
-        "- 问题4-2以历史联合情景制定计划购电量，实际运行时逐10分钟观测实时电价并执行储能。",
+        "- 问题4-2调用问题2原随机规划模型；计划阶段使用因果价格，执行和结算使用当日实际实时价格。",
         "- 问题4-3按问题3口径，使用附件3预报并允许6:00、12:00、18:00滚动调整。",
+        f"- 6:00、12:00、18:00先比较保持当前计划与重新优化的同一情景剩余费用；"
+        f"仅当预计节省不低于{update_saving_threshold_yuan:.6f}元且相对节省不低于"
+        f"{update_saving_relative_threshold:.6%}时接受更新。",
         "- 问题4-3制定计划和调整策略时，不使用未来实时电价；未来时段价格",
         "  使用已观察价格加历史同日价格增量构造情景，实际结算才使用当日实时价格。",
         "- 储能从2025年1月1日0:00的6000 kWh开始跨日连续运行；1月用于预热，",
@@ -649,6 +654,12 @@ def write_report(
         "",
         "```text",
         csv_block(specified43),
+        "```",
+        "",
+        "## 问题4-3预报更新方案全年对比",
+        "",
+        "```text",
+        csv_block(scenario_summary),
         "```",
         "",
         "## 问题4-3预报缩放灵敏度",
@@ -767,6 +778,7 @@ def main() -> None:
         price_by_date,
         decision_price_by_date=causal_price_forecast,
         fallback_load_profile_kwh=fallback_load_profile,
+        collect_update_scenarios=True,
     )
     validation43 = validate_result_detail(
         detail43,
@@ -908,6 +920,11 @@ def main() -> None:
             index=False,
             encoding="utf-8-sig",
         )
+        scenario_summary.to_csv(
+            tables_dir / "问题4-3_四类累计更新方案对比.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     forecast_sensitivity.to_csv(
         tables_dir / "问题4-3_预报缩放灵敏度.csv",
         index=False,
@@ -944,6 +961,12 @@ def main() -> None:
             sheet_name="指定日期对比",
             index=False,
         )
+        if not scenario_summary.empty:
+            scenario_summary.to_excel(
+                writer,
+                sheet_name="预报更新方案对比",
+                index=False,
+            )
 
     plot_prices(data, figures_dir / "指定日期_波动电价.png")
     plot_forecast_and_dispatch(
@@ -979,6 +1002,8 @@ def main() -> None:
         forecast_sensitivity,
         price_sensitivity,
         storage,
+        1.0,
+        1e-4,
     )
     summary = {
         "问题4-3价格信息口径": {
@@ -1001,6 +1026,13 @@ def main() -> None:
             "调整购电量_kWh": float(daily43["调整购电量_kWh"].sum()),
             "紧急购电量_kWh": float(daily43["紧急购电量_kWh"].sum()),
             "总费用_元": float(daily43["总费用_元"].sum()),
+        },
+        "问题4-3更新决策": {
+            "绝对节省阈值_元": 1.0,
+            "相对节省阈值": 1e-4,
+            "预报更新方案全年对比": scenario_summary.to_dict(
+                orient="records"
+            ),
         },
         "约束校验": {
             "问题4-2": validation42,
