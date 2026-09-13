@@ -1566,7 +1566,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-sensitivity",
         action="store_true",
-        help="跳过±5%、±10%灵敏度分析。",
+        help="跳过±5%%、±10%%灵敏度分析。",
     )
     args = parser.parse_args()
 

@@ -4,17 +4,21 @@
     "type": "split",
     "children": [
       {
-        "id": "dc30582a4d45ad0c",
+        "id": "1eb2fc9b5444b03e",
         "type": "tabs",
         "children": [
           {
-            "id": "21356e5c988f4244",
+            "id": "7e46ad03265a3bdb",
             "type": "leaf",
             "state": {
-              "type": "empty",
-              "state": {},
+              "type": "markdown",
+              "state": {
+                "file": "论文附录_最核心求解函数.md",
+                "mode": "source",
+                "source": false
+              },
               "icon": "lucide-file",
-              "title": "新标签页"
+              "title": "论文附录_最核心求解函数"
             }
           }
         ]
@@ -184,13 +188,29 @@
       "bases:新建数据库": false
     }
   },
-  "active": "21356e5c988f4244",
+  "active": "7e46ad03265a3bdb",
   "lastOpenFiles": [
-    "问题三/results/~$result3.xlsx",
     "问题四/output/figures/问题4-3_预报更新时点_边际价值.png",
-    "问题四/output/tables/问题4-3_四类累计更新方案对比.csv",
-    "问题四/output/tables/问题4-3_预报更新情景汇总.csv",
-    "问题四/output/tables/问题4-3_预报更新情景逐日.csv",
+    "问题四/output/figures/预报更新时点_边际价值.png",
+    "~$附录_终稿_15页以内.docx",
+    "论文附录_终稿_15页以内.docx",
+    "tools/md_to_docx_appendix.py",
+    "tools",
+    "论文附录_终稿_15页以内.md",
+    "论文附录_提交版_15页以内.md",
+    "论文附录_最核心求解函数.md",
+    "_generate_core_appendix.py",
+    "论文附录_文件清单.md",
+    "论文附录_核心求解代码.md",
+    "题目/问题三数据处理结果",
+    "题目/问题一数据处理结果/figures/预处理_负载光伏与净负荷电量.png",
+    "题目/问题一数据处理结果/figures/预处理_负载光伏与净负荷功率.png",
+    "题目/问题一数据处理结果/figures/预处理_电价曲线.png",
+    "题目/问题一数据处理结果/问题一预处理数据.csv",
+    "题目/问题一数据处理结果/figures",
+    "题目/问题一数据处理结果",
+    "问题三/README.md",
+    "题目/C题.pdf",
     "论文/问题四_模型建立与求解_论文稿.md",
     "摘要提示词.md",
     "问题四检验.md",
@@ -199,12 +219,6 @@
     "问题二/问题二_模型算法推导与检验.md",
     "问题三/问题三_关键约束与输出要求.md",
     "问题三/问题三_模型算法推导与检验.md",
-    "问题三（凌晨版.zip",
-    "问题三.zip",
-    "问题三/results/~$表2_指定日期充放电量.xlsx",
-    "问题四/output/result4-3_template_test.xlsx",
-    "问题四/output/result4-2_template_test.xlsx",
-    "题目/附件/问题三数据处理结果/tables/表3_指定日期紧急购电量.csv",
     "各题模型/问题三_约束提取与模型迁移分析(1).md",
     "各题模型/问题三_约束提取与模型迁移分析.md",
     "各题模型/第四问_时变MILP_滚动MILP_LP推导与检验.md",
@@ -217,19 +231,10 @@
     "问题二/output_candidate_base/figures/指定日期_充放电功率与储电量.png",
     "问题二/output_candidate_base/figures/指定日期_负载光伏净负荷与计划购电.png",
     "问题二/output_calibrated_v01/结果说明.md",
-    "问题二/output_calibrated_v01/figures/灵敏度分析.png",
-    "问题二/output_calibrated_v01/figures/指定日期_充放电功率与储电量.png",
-    "问题二/output_calibrated_v01/figures/指定日期_负载光伏净负荷与计划购电.png",
     "问题二/output_calibrated_v02/结果说明.md",
     "问题二/output_objective_v1/结果说明.md",
     "问题二/output_reserve_v05/结果说明.md",
     "问题二/output_reserve_v1/结果说明.md",
-    "问题二/output_adaptive_plan5_exec30/结果说明.md",
-    "问题二/output_adaptive_hybrid30/结果说明.md",
-    "问题二/output_adaptive30/结果说明.md",
-    "问题二/output_adaptive_test/结果说明.md",
-    "题目/附件/问题二数据处理结果/结果说明.md",
-    "问题二/output_new/结果说明.md",
-    "题目/附件/问题三数据处理结果/问题三_结果说明.md"
+    "问题二/output_adaptive_plan5_exec30/结果说明.md"
   ]
 }
