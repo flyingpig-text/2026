@@ -19,9 +19,13 @@ from typing import Any, Mapping, Protocol
 import numpy as np
 import pandas as pd
 
-Q2_DIR = Path(__file__).resolve().parents[1] / "问题二"
-if str(Q2_DIR) not in sys.path:
-    sys.path.insert(0, str(Q2_DIR))
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+for module_dir in (
+    PROJECT_DIR / "问题二",
+    PROJECT_DIR / "问题三",
+):
+    if str(module_dir) not in sys.path:
+        sys.path.insert(0, str(module_dir))
 
 import problem2_adaptive as p2_adaptive
 import problem2_stochastic as p2_stochastic

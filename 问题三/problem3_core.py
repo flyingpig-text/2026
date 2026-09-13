@@ -55,13 +55,13 @@ FOUR_HOUR_BLOCKS = (
 def load_problem2_module():
     """加载问题2代码，复用其附件读取、参数提取和基础MILP工具。"""
     root = Path(__file__).resolve().parents[1]
-    cache_dir = Path(__file__).resolve().parent / ".cache"
+    cache_dir = (
+        Path(__file__).resolve().parent
+        / ".cache"
+        / "matplotlib"
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["MPLCONFIGDIR"] = str(cache_dir / "matplotlib")
-    os.environ["TEMP"] = str(cache_dir)
-    os.environ["TMP"] = str(cache_dir)
-    os.environ["TMPDIR"] = str(cache_dir)
-    Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(cache_dir)
     candidates = [
         root / "题目" / "附件" / "问题二数据处理结果" / "problem2_data_optimization.py",
         root / "问题二" / "problem2_data_optimization.py",
